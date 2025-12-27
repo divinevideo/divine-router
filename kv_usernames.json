@@ -1,0 +1,11 @@
+{
+  "rabble": {
+    "data": "{\"pubkey\":\"76c71aae3a491f1d9eec47cba17e229cda4113a0bbb6e6ae1776d7643e29cafa\",\"relays\":[\"wss://relay.damus.io\",\"wss://nos.lol\"],\"status\":\"active\"}"
+  },
+  "alice": {
+    "data": "{\"pubkey\":\"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\",\"relays\":[\"wss://relay.nostr.band\"],\"status\":\"active\"}"
+  },
+  "testuser": {
+    "data": "{\"pubkey\":\"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\",\"relays\":[],\"status\":\"pending\"}"
+  }
+}

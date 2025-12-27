@@ -1,0 +1,27 @@
+# ABOUTME: Git ignore file for divine-router Fastly Compute project
+# ABOUTME: Excludes build artifacts, Rust target, and local dev files
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Fastly Compute artifacts
+/bin/
+*.wasm
+pkg/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local development
+.env
+.env.local

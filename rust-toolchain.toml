@@ -1,0 +1,6 @@
+# ABOUTME: Rust toolchain configuration for Fastly Compute
+# ABOUTME: Specifies stable Rust with wasm32-wasip1 target for edge deployment
+
+[toolchain]
+channel = "stable"
+targets = ["wasm32-wasip1"]
