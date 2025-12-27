@@ -6,20 +6,20 @@ description = "Edge router for divine.video wildcard subdomains"
 language = "rust"
 manifest_version = 3
 name = "divine-router"
-# service_id = "" # Set after first deploy
+service_id = "76fTayX6mBKa8faLeZ1fet"
 
 [local_server]
 
   [local_server.backends]
-    # Main website (apex and www)
+
     [local_server.backends.main_site]
       url = "https://dvines.org"
 
-    # Username profile handler
     [local_server.backends.username_handler]
       url = "https://dvines.org"
 
   [local_server.kv_stores]
+
     [local_server.kv_stores.usernames]
       file = "kv_usernames.json"
       format = "json"
@@ -28,7 +28,9 @@ name = "divine-router"
   build = "cargo build --profile release --target wasm32-wasip1"
 
 [setup]
+
   [setup.backends]
+
     [setup.backends.main_site]
       address = "dvines.org"
       port = 443
@@ -38,4 +40,5 @@ name = "divine-router"
       port = 443
 
   [setup.kv_stores]
+
     [setup.kv_stores.usernames]
