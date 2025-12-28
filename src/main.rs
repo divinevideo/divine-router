@@ -85,11 +85,13 @@ fn classify_host(host: &str) -> HostType {
     let hostname = host.split(':').next().unwrap_or(host);
     let parts: Vec<&str> = hostname.split('.').collect();
 
-    // Check for our domains (dvines.org for testing, divine.video for prod)
+    // Check for our domains
     let is_our_domain = parts.len() >= 2 && {
         let tld = parts[parts.len() - 1];
         let sld = parts[parts.len() - 2];
-        (sld == "dvines" && tld == "org") || (sld == "divine" && tld == "video")
+        (sld == "dvines" && tld == "org")
+            || (sld == "divine" && tld == "video")
+            || (sld == "dvine" && tld == "video")
     };
 
     if !is_our_domain {
