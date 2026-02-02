@@ -232,17 +232,114 @@ fn lookup_username(username: &str) -> Option<UsernameData> {
     serde_json::from_slice(&body).ok()
 }
 
-fn serve_profile(username: &str, _data: &UsernameData, req: Request) -> Result<Response, Error> {
-    // Pass through to main_backend (divine-web) which will serve the SPA
-    // with injected user data. We pass the original hostname in a custom header
-    // so divine-web knows this is a subdomain profile request.
-    let original_host = req.get_header_str("host").unwrap_or("").to_string();
+fn serve_profile(username: &str, data: &UsernameData, _req: Request) -> Result<Response, Error> {
+    // Generate an HTML page that:
+    // 1. Sets window.__DIVINE_USER__ with user data
+    // 2. Redirects to the profile page via client-side navigation
+    // This ensures the user data is available when the SPA loads
 
-    let mut req = req;
-    req.set_header(header::HOST, MAIN_BACKEND_HOST);
-    // Pass original host and username for divine-web to handle
-    req.set_header("X-Original-Host", original_host.as_str());
-    req.set_header("X-Username", username);
+    let npub = hex_to_npub(&data.pubkey).unwrap_or_else(|_| data.pubkey.clone());
 
-    Ok(req.send(MAIN_BACKEND)?)
+    let user_data_json = serde_json::json!({
+        "subdomain": username,
+        "pubkey": data.pubkey,
+        "npub": npub,
+        "username": username,
+        "nip05": format!("{}@divine.video", username)
+    });
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loading {0}...</title>
+    <meta property="og:title" content="{0} on diVine" />
+    <meta property="og:url" content="https://{0}.divine.video/" />
+    <meta property="og:type" content="profile" />
+    <script>
+        window.__DIVINE_USER__ = {1};
+        // Store in sessionStorage for SPA to read after redirect
+        sessionStorage.setItem('divine_user', JSON.stringify(window.__DIVINE_USER__));
+        // Redirect to profile page
+        window.location.replace('/profile/' + window.__DIVINE_USER__.npub);
+    </script>
+</head>
+<body>
+    <p>Loading profile...</p>
+</body>
+</html>"#, username, user_data_json);
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "no-cache, no-store")
+        .with_body(html))
+}
+
+fn hex_to_npub(hex: &str) -> Result<String, ()> {
+    if hex.len() != 64 {
+        return Err(());
+    }
+
+    let data: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&hex[i*2..i*2+2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|_| ())?;
+
+    // Convert 8-bit to 5-bit
+    let mut converted = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+
+    for value in &data {
+        acc = (acc << 8) | (*value as u32);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            converted.push(((acc >> bits) & 31) as u8);
+        }
+    }
+    if bits > 0 {
+        converted.push(((acc << (5 - bits)) & 31) as u8);
+    }
+
+    // Bech32 checksum
+    let hrp = "npub";
+    let hrp_expand: Vec<u8> = hrp.chars()
+        .map(|c| c as u8 >> 5)
+        .chain(std::iter::once(0))
+        .chain(hrp.chars().map(|c| c as u8 & 31))
+        .collect();
+
+    let checksum = bech32_checksum(&hrp_expand, &converted);
+
+    // Encode
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut result = String::from("npub1");
+    for b in converted.iter().chain(checksum.iter()) {
+        result.push(CHARSET[*b as usize] as char);
+    }
+
+    Ok(result)
+}
+
+fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
+    const GEN: [u32; 5] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+    let mut values: Vec<u8> = hrp_expand.to_vec();
+    values.extend(data);
+    values.extend(&[0u8; 6]);
+
+    let mut chk = 1u32;
+    for v in &values {
+        let top = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ (*v as u32);
+        for (i, g) in GEN.iter().enumerate() {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    chk ^= 1;
+
+    (0..6).map(|i| ((chk >> (5 * (5 - i))) & 31) as u8).collect()
 }
