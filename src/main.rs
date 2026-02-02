@@ -9,7 +9,11 @@ use std::collections::HashSet;
 
 const MAIN_BACKEND: &str = "main_site";
 const USERNAME_BACKEND: &str = "username_handler";
+const BLOSSOM_BACKEND: &str = "blossom";
 const KV_STORE_NAME: &str = "usernames";
+
+// Subdomains that route to blossom/media server
+const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
 
 // System subdomains that should passthrough to origin
 const SYSTEM_SUBDOMAINS: &[&str] = &[
@@ -60,10 +64,14 @@ fn main(req: Request) -> Result<Response, Error> {
             // Multi-level subdomain (*.admin.dvines.org) - passthrough
             passthrough(req, MAIN_BACKEND)
         }
-        HostType::System(_subdomain) => {
-            // Known system subdomain - passthrough
-            // TODO: Could route to specific backends per subdomain
-            passthrough(req, MAIN_BACKEND)
+        HostType::System(subdomain) => {
+            // Route to appropriate backend based on subdomain
+            let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
+            if blossom_set.contains(subdomain.as_str()) {
+                passthrough(req, BLOSSOM_BACKEND)
+            } else {
+                passthrough(req, MAIN_BACKEND)
+            }
         }
         HostType::Username(username) => {
             // Potential username subdomain
@@ -118,8 +126,20 @@ fn classify_host(host: &str) -> HostType {
     }
 }
 
+// Backend host headers - must match what the backend expects
+const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
+const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
+
 fn passthrough(req: Request, backend: &str) -> Result<Response, Error> {
-    // Simply forward the request to the backend
+    // Set the Host header to what the backend expects
+    let backend_host = match backend {
+        MAIN_BACKEND => MAIN_BACKEND_HOST,
+        BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
+        _ => MAIN_BACKEND_HOST,
+    };
+
+    let mut req = req;
+    req.set_header(header::HOST, backend_host);
     Ok(req.send(backend)?)
 }
 
@@ -212,15 +232,17 @@ fn lookup_username(username: &str) -> Option<UsernameData> {
     serde_json::from_slice(&body).ok()
 }
 
-fn serve_profile(_username: &str, data: &UsernameData, _req: Request) -> Result<Response, Error> {
-    // Option 1: Redirect to main site profile page
-    // Option 2: Proxy to a profile service
-    // Option 3: Render a simple profile page
+fn serve_profile(username: &str, _data: &UsernameData, req: Request) -> Result<Response, Error> {
+    // Pass through to main_backend (divine-web) which will serve the SPA
+    // with injected user data. We pass the original hostname in a custom header
+    // so divine-web knows this is a subdomain profile request.
+    let original_host = req.get_header_str("host").unwrap_or("").to_string();
 
-    // For now, redirect to divine.video/profile/{npub}
-    // TODO: Convert pubkey to npub
-    let redirect_url = format!("https://divine.video/profile/{}", data.pubkey);
+    let mut req = req;
+    req.set_header(header::HOST, MAIN_BACKEND_HOST);
+    // Pass original host and username for divine-web to handle
+    req.set_header("X-Original-Host", original_host.as_str());
+    req.set_header("X-Username", username);
 
-    Ok(Response::from_status(StatusCode::MOVED_PERMANENTLY)
-        .with_header(header::LOCATION, redirect_url))
+    Ok(req.send(MAIN_BACKEND)?)
 }
