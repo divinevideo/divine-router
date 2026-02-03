@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 const MAIN_BACKEND: &str = "main_site";
-const USERNAME_BACKEND: &str = "username_handler";
 const BLOSSOM_BACKEND: &str = "blossom";
 const KV_STORE_NAME: &str = "usernames";
 
@@ -32,7 +31,7 @@ const SYSTEM_SUBDOMAINS: &[&str] = &[
 ];
 
 /// Username data stored in KV
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct UsernameData {
     pubkey: String,
     #[serde(default)]
@@ -42,7 +41,7 @@ struct UsernameData {
 }
 
 /// NIP-05 response format
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Nip05Response {
     names: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,7 +79,7 @@ fn main(req: Request) -> Result<Response, Error> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum HostType {
     Apex,
     MultiLevel,
@@ -178,7 +177,7 @@ fn handle_username_request(username: &str, path: &str, req: Request) -> Result<R
 }
 
 fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
-    // NIP-05 can also have ?name= query param
+    // Get the queried name from ?name= parameter, default to username
     let url = req.get_url();
     let queried_name = url
         .query_pairs()
@@ -186,41 +185,55 @@ fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
         .map(|(_, v)| v.to_string())
         .unwrap_or_else(|| username.to_string());
 
-    let lookup_name = queried_name.to_lowercase();
+    // Always look up the subdomain username in KV, not the queried name
+    let user_data = lookup_username(username);
 
-    match lookup_username(&lookup_name) {
+    let response = build_nip05_response(username, &queried_name, user_data.as_ref());
+    let body = serde_json::to_string(&response).unwrap_or_default();
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_header("Access-Control-Allow-Origin", "*")
+        .with_body(body))
+}
+
+/// Build NIP-05 response. This is a pure function for easy testing.
+///
+/// Per NIP-05 spec:
+/// - `daniel@divine.video` queries `divine.video/.well-known/nostr.json?name=daniel`
+///   and expects `{ "names": { "daniel": "pubkey" } }`
+/// - `_@daniel.divine.video` queries `daniel.divine.video/.well-known/nostr.json?name=_`
+///   and expects `{ "names": { "_": "pubkey" } }`
+///
+/// For subdomain requests, we always look up the subdomain username but return
+/// the queried name in the response.
+fn build_nip05_response(
+    _username: &str,
+    queried_name: &str,
+    user_data: Option<&UsernameData>,
+) -> Nip05Response {
+    match user_data {
         Some(data) if data.status == "active" => {
             let mut names = std::collections::HashMap::new();
-            names.insert(lookup_name.clone(), data.pubkey.clone());
+            // Use the queried name in the response (e.g., "_" for subdomain format)
+            names.insert(queried_name.to_lowercase(), data.pubkey.clone());
 
             let relays = if !data.relays.is_empty() {
                 let mut relay_map = std::collections::HashMap::new();
-                relay_map.insert(data.pubkey, data.relays);
+                relay_map.insert(data.pubkey.clone(), data.relays.clone());
                 Some(relay_map)
             } else {
                 None
             };
 
-            let response = Nip05Response { names, relays };
-            let body = serde_json::to_string(&response).unwrap_or_default();
-
-            Ok(Response::from_status(StatusCode::OK)
-                .with_header(header::CONTENT_TYPE, "application/json")
-                .with_header("Access-Control-Allow-Origin", "*")
-                .with_body(body))
+            Nip05Response { names, relays }
         }
         _ => {
-            // Username not found
-            let response = Nip05Response {
+            // Username not found or not active
+            Nip05Response {
                 names: std::collections::HashMap::new(),
                 relays: None,
-            };
-            let body = serde_json::to_string(&response).unwrap_or_default();
-
-            Ok(Response::from_status(StatusCode::OK)
-                .with_header(header::CONTENT_TYPE, "application/json")
-                .with_header("Access-Control-Allow-Origin", "*")
-                .with_body(body))
+            }
         }
     }
 }
@@ -342,4 +355,163 @@ fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
     chk ^= 1;
 
     (0..6).map(|i| ((chk >> (5 * (5 - i))) & 31) as u8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_active_user(pubkey: &str, relays: Vec<String>) -> UsernameData {
+        UsernameData {
+            pubkey: pubkey.to_string(),
+            relays,
+            status: "active".to_string(),
+        }
+    }
+
+    fn make_inactive_user(pubkey: &str) -> UsernameData {
+        UsernameData {
+            pubkey: pubkey.to_string(),
+            relays: vec![],
+            status: "inactive".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_nip05_response_subdomain_with_underscore() {
+        // Scenario: _@daniel.divine.video
+        // Request: daniel.divine.video/.well-known/nostr.json?name=_
+        // Should look up "daniel" but return "_" in response
+        let user = make_active_user("abc123pubkey", vec![]);
+        let response = build_nip05_response("daniel", "_", Some(&user));
+
+        assert_eq!(response.names.len(), 1);
+        assert_eq!(response.names.get("_"), Some(&"abc123pubkey".to_string()));
+        assert!(response.relays.is_none());
+    }
+
+    #[test]
+    fn test_build_nip05_response_subdomain_with_username() {
+        // Scenario: daniel@daniel.divine.video (querying own name on subdomain)
+        // Request: daniel.divine.video/.well-known/nostr.json?name=daniel
+        let user = make_active_user("abc123pubkey", vec![]);
+        let response = build_nip05_response("daniel", "daniel", Some(&user));
+
+        assert_eq!(response.names.len(), 1);
+        assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
+    }
+
+    #[test]
+    fn test_build_nip05_response_with_relays() {
+        let relays = vec![
+            "wss://relay.divine.video".to_string(),
+            "wss://relay.damus.io".to_string(),
+        ];
+        let user = make_active_user("abc123pubkey", relays.clone());
+        let response = build_nip05_response("daniel", "_", Some(&user));
+
+        assert_eq!(response.names.get("_"), Some(&"abc123pubkey".to_string()));
+        assert!(response.relays.is_some());
+        let relay_map = response.relays.unwrap();
+        assert_eq!(relay_map.get("abc123pubkey"), Some(&relays));
+    }
+
+    #[test]
+    fn test_build_nip05_response_user_not_found() {
+        let response = build_nip05_response("unknown", "_", None);
+
+        assert!(response.names.is_empty());
+        assert!(response.relays.is_none());
+    }
+
+    #[test]
+    fn test_build_nip05_response_user_inactive() {
+        let user = make_inactive_user("abc123pubkey");
+        let response = build_nip05_response("daniel", "_", Some(&user));
+
+        assert!(response.names.is_empty());
+        assert!(response.relays.is_none());
+    }
+
+    #[test]
+    fn test_build_nip05_response_case_insensitive() {
+        // Queried name should be lowercased in response
+        let user = make_active_user("abc123pubkey", vec![]);
+        let response = build_nip05_response("Daniel", "DANIEL", Some(&user));
+
+        assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
+        assert!(!response.names.contains_key("DANIEL"));
+    }
+
+    #[test]
+    fn test_classify_host_apex() {
+        assert_eq!(classify_host("divine.video"), HostType::Apex);
+        assert_eq!(classify_host("dvine.video"), HostType::Apex);
+        assert_eq!(classify_host("dvines.org"), HostType::Apex);
+    }
+
+    #[test]
+    fn test_classify_host_with_port() {
+        assert_eq!(classify_host("divine.video:443"), HostType::Apex);
+        assert_eq!(classify_host("daniel.divine.video:8080"), HostType::Username("daniel".to_string()));
+    }
+
+    #[test]
+    fn test_classify_host_system_subdomain() {
+        assert_eq!(classify_host("www.divine.video"), HostType::System("www".to_string()));
+        assert_eq!(classify_host("api.divine.video"), HostType::System("api".to_string()));
+        assert_eq!(classify_host("relay.divine.video"), HostType::System("relay".to_string()));
+        assert_eq!(classify_host("media.divine.video"), HostType::System("media".to_string()));
+    }
+
+    #[test]
+    fn test_classify_host_username_subdomain() {
+        assert_eq!(classify_host("daniel.divine.video"), HostType::Username("daniel".to_string()));
+        assert_eq!(classify_host("alice.dvine.video"), HostType::Username("alice".to_string()));
+        assert_eq!(classify_host("bob.dvines.org"), HostType::Username("bob".to_string()));
+    }
+
+    #[test]
+    fn test_classify_host_username_case_insensitive() {
+        // Subdomain is lowercased, but domain check is case-sensitive
+        // (hostnames come lowercase from HTTP headers in practice)
+        assert_eq!(classify_host("DANIEL.divine.video"), HostType::Username("daniel".to_string()));
+    }
+
+    #[test]
+    fn test_classify_host_multi_level() {
+        assert_eq!(classify_host("foo.bar.divine.video"), HostType::MultiLevel);
+        assert_eq!(classify_host("a.b.c.dvines.org"), HostType::MultiLevel);
+    }
+
+    #[test]
+    fn test_classify_host_unknown_domain() {
+        assert_eq!(classify_host("example.com"), HostType::Apex);
+        assert_eq!(classify_host("foo.example.com"), HostType::Apex);
+    }
+
+    #[test]
+    fn test_hex_to_npub_valid() {
+        // Known test vector
+        let hex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
+        let result = hex_to_npub(hex);
+        assert!(result.is_ok());
+        let npub = result.unwrap();
+        assert!(npub.starts_with("npub1"));
+        assert_eq!(npub.len(), 63); // npub1 + 58 chars
+    }
+
+    #[test]
+    fn test_hex_to_npub_invalid_length() {
+        assert!(hex_to_npub("abc").is_err());
+        assert!(hex_to_npub("").is_err());
+        assert!(hex_to_npub("abc123").is_err());
+    }
+
+    #[test]
+    fn test_hex_to_npub_invalid_hex() {
+        // 64 chars but not valid hex
+        let invalid = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
+        assert!(hex_to_npub(invalid).is_err());
+    }
 }
