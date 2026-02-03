@@ -188,7 +188,7 @@ fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
     // Always look up the subdomain username in KV, not the queried name
     let user_data = lookup_username(username);
 
-    let response = build_nip05_response(username, &queried_name, user_data.as_ref());
+    let response = build_nip05_response(&queried_name, user_data.as_ref());
     let body = serde_json::to_string(&response).unwrap_or_default();
 
     Ok(Response::from_status(StatusCode::OK)
@@ -205,10 +205,9 @@ fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
 /// - `_@daniel.divine.video` queries `daniel.divine.video/.well-known/nostr.json?name=_`
 ///   and expects `{ "names": { "_": "pubkey" } }`
 ///
-/// For subdomain requests, we always look up the subdomain username but return
-/// the queried name in the response.
+/// For subdomain requests, the caller looks up the subdomain username in KV,
+/// but this function uses `queried_name` in the response.
 fn build_nip05_response(
-    _username: &str,
     queried_name: &str,
     user_data: Option<&UsernameData>,
 ) -> Nip05Response {
@@ -381,9 +380,9 @@ mod tests {
     fn test_build_nip05_response_subdomain_with_underscore() {
         // Scenario: _@daniel.divine.video
         // Request: daniel.divine.video/.well-known/nostr.json?name=_
-        // Should look up "daniel" but return "_" in response
+        // Caller looks up "daniel" in KV, passes user_data here with queried_name="_"
         let user = make_active_user("abc123pubkey", vec![]);
-        let response = build_nip05_response("daniel", "_", Some(&user));
+        let response = build_nip05_response("_", Some(&user));
 
         assert_eq!(response.names.len(), 1);
         assert_eq!(response.names.get("_"), Some(&"abc123pubkey".to_string()));
@@ -395,7 +394,7 @@ mod tests {
         // Scenario: daniel@daniel.divine.video (querying own name on subdomain)
         // Request: daniel.divine.video/.well-known/nostr.json?name=daniel
         let user = make_active_user("abc123pubkey", vec![]);
-        let response = build_nip05_response("daniel", "daniel", Some(&user));
+        let response = build_nip05_response("daniel", Some(&user));
 
         assert_eq!(response.names.len(), 1);
         assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
@@ -408,7 +407,7 @@ mod tests {
             "wss://relay.damus.io".to_string(),
         ];
         let user = make_active_user("abc123pubkey", relays.clone());
-        let response = build_nip05_response("daniel", "_", Some(&user));
+        let response = build_nip05_response("_", Some(&user));
 
         assert_eq!(response.names.get("_"), Some(&"abc123pubkey".to_string()));
         assert!(response.relays.is_some());
@@ -418,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_build_nip05_response_user_not_found() {
-        let response = build_nip05_response("unknown", "_", None);
+        let response = build_nip05_response("_", None);
 
         assert!(response.names.is_empty());
         assert!(response.relays.is_none());
@@ -427,7 +426,7 @@ mod tests {
     #[test]
     fn test_build_nip05_response_user_inactive() {
         let user = make_inactive_user("abc123pubkey");
-        let response = build_nip05_response("daniel", "_", Some(&user));
+        let response = build_nip05_response("_", Some(&user));
 
         assert!(response.names.is_empty());
         assert!(response.relays.is_none());
@@ -437,7 +436,7 @@ mod tests {
     fn test_build_nip05_response_case_insensitive() {
         // Queried name should be lowercased in response
         let user = make_active_user("abc123pubkey", vec![]);
-        let response = build_nip05_response("Daniel", "DANIEL", Some(&user));
+        let response = build_nip05_response("DANIEL", Some(&user));
 
         assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
         assert!(!response.names.contains_key("DANIEL"));
@@ -486,6 +485,7 @@ mod tests {
 
     #[test]
     fn test_classify_host_unknown_domain() {
+        // Unknown domains return Apex to trigger passthrough to main backend
         assert_eq!(classify_host("example.com"), HostType::Apex);
         assert_eq!(classify_host("foo.example.com"), HostType::Apex);
     }
