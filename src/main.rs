@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
-const KV_STORE_NAME: &str = "usernames";
+const KV_STORE_NAME: &str = "divine-names";
 
 // Subdomains that route to blossom/media server
 const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
@@ -239,7 +239,8 @@ fn build_nip05_response(
 
 fn lookup_username(username: &str) -> Option<UsernameData> {
     let kv_store = KVStore::open(KV_STORE_NAME).ok()??;
-    let mut lookup = kv_store.lookup(username).ok()?;
+    let key = format!("user:{}", username);
+    let mut lookup = kv_store.lookup(&key).ok()?;
     let body = lookup.take_body().into_bytes();
     serde_json::from_slice(&body).ok()
 }
