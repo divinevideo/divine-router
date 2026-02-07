@@ -153,7 +153,7 @@ fn handle_username_request(username: &str, path: &str, req: Request) -> Result<R
 
     match user_data {
         Some(data) if data.status == "active" => {
-            // Valid username - serve profile or redirect
+            // Valid username - forward to divine-web backend
             serve_profile(username, &data, req)
         }
         _ => {
@@ -240,55 +240,42 @@ fn build_nip05_response(
 fn lookup_username(username: &str) -> Option<UsernameData> {
     let kv_store = KVStore::open(KV_STORE_NAME).ok()??;
     let key = format!("user:{}", username);
-    let mut lookup = kv_store.lookup(&key).ok()?;
+    if let Some(data) = try_kv_lookup(&kv_store, &key) {
+        return Some(data);
+    }
+
+    // Defensive fallback: strip dots and retry (handles legacy dotted names like lele.pons -> lelepons)
+    if username.contains('.') {
+        let dotless: String = username.chars().filter(|c| *c != '.').collect();
+        let dotless_key = format!("user:{}", dotless);
+        return try_kv_lookup(&kv_store, &dotless_key);
+    }
+
+    None
+}
+
+fn try_kv_lookup(kv_store: &KVStore, key: &str) -> Option<UsernameData> {
+    let mut lookup = kv_store.lookup(key).ok()?;
     let body = lookup.take_body().into_bytes();
     serde_json::from_slice(&body).ok()
 }
 
-fn serve_profile(username: &str, data: &UsernameData, _req: Request) -> Result<Response, Error> {
-    // Generate an HTML page that:
-    // 1. Sets window.__DIVINE_USER__ with user data
-    // 2. Redirects to the profile page via client-side navigation
-    // This ensures the user data is available when the SPA loads
+fn serve_profile(_username: &str, _data: &UsernameData, req: Request) -> Result<Response, Error> {
+    // Forward to divine-web backend with X-Original-Host header.
+    // The divine-web edge worker handles subdomain profiles by injecting
+    // window.__DIVINE_USER__ into the SPA HTML and serving it directly.
+    let original_host = req
+        .get_header_str("host")
+        .unwrap_or("")
+        .to_string();
 
-    let npub = hex_to_npub(&data.pubkey).unwrap_or_else(|_| data.pubkey.clone());
-
-    let user_data_json = serde_json::json!({
-        "subdomain": username,
-        "pubkey": data.pubkey,
-        "npub": npub,
-        "username": username,
-        "nip05": format!("{}@divine.video", username)
-    });
-
-    let html = format!(r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Loading {0}...</title>
-    <meta property="og:title" content="{0} on diVine" />
-    <meta property="og:url" content="https://{0}.divine.video/" />
-    <meta property="og:type" content="profile" />
-    <script>
-        window.__DIVINE_USER__ = {1};
-        // Store in sessionStorage for SPA to read after redirect
-        sessionStorage.setItem('divine_user', JSON.stringify(window.__DIVINE_USER__));
-        // Redirect to profile page
-        window.location.replace('/profile/' + window.__DIVINE_USER__.npub);
-    </script>
-</head>
-<body>
-    <p>Loading profile...</p>
-</body>
-</html>"#, username, user_data_json);
-
-    Ok(Response::from_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .with_header(header::CACHE_CONTROL, "no-cache, no-store")
-        .with_body(html))
+    let mut req = req;
+    req.set_header(header::HOST, MAIN_BACKEND_HOST);
+    req.set_header("X-Original-Host", &original_host);
+    Ok(req.send(MAIN_BACKEND)?)
 }
 
+#[allow(dead_code)]
 fn hex_to_npub(hex: &str) -> Result<String, ()> {
     if hex.len() != 64 {
         return Err(());
@@ -336,6 +323,7 @@ fn hex_to_npub(hex: &str) -> Result<String, ()> {
     Ok(result)
 }
 
+#[allow(dead_code)]
 fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
     const GEN: [u32; 5] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
     let mut values: Vec<u8> = hrp_expand.to_vec();
