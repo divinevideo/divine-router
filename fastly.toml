@@ -13,10 +13,13 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
   [local_server.backends]
 
     [local_server.backends.main_site]
-      url = "https://dvines.org"
+      url = "https://inherently-ethical-gelding.edgecompute.app"
 
     [local_server.backends.username_handler]
-      url = "https://dvines.org"
+      url = "https://inherently-ethical-gelding.edgecompute.app"
+
+    [local_server.backends.blossom]
+      url = "https://separately-robust-roughy.edgecompute.app"
 
   [local_server.kv_stores]
 
@@ -32,11 +35,15 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
   [setup.backends]
 
     [setup.backends.main_site]
-      address = "dvines.org"
+      address = "inherently-ethical-gelding.edgecompute.app"
       port = 443
 
     [setup.backends.username_handler]
-      address = "dvines.org"
+      address = "inherently-ethical-gelding.edgecompute.app"
+      port = 443
+
+    [setup.backends.blossom]
+      address = "separately-robust-roughy.edgecompute.app"
       port = 443
 
   [setup.kv_stores]
