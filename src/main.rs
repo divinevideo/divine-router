@@ -28,6 +28,11 @@ const SYSTEM_SUBDOMAINS: &[&str] = &[
     "stream",
     "media",
     "gateway",
+    "names",
+    "login",
+    "pds",
+    "feed",
+    "labeler",
 ];
 
 /// Username data stored in KV
@@ -38,6 +43,10 @@ struct UsernameData {
     relays: Vec<String>,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    atproto_did: Option<String>,
+    #[serde(default)]
+    atproto_state: Option<String>,
 }
 
 /// NIP-05 response format
@@ -143,6 +152,11 @@ fn passthrough(req: Request, backend: &str) -> Result<Response, Error> {
 }
 
 fn handle_username_request(username: &str, path: &str, req: Request) -> Result<Response, Error> {
+    // Check if this is an ATProto DID resolution request
+    if path == "/.well-known/atproto-did" {
+        return handle_atproto_did(username);
+    }
+
     // Check if this is a NIP-05 request
     if path == "/.well-known/nostr.json" {
         return handle_nip05(username, &req);
@@ -195,6 +209,27 @@ fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_header("Access-Control-Allow-Origin", "*")
         .with_body(body))
+}
+
+fn handle_atproto_did(username: &str) -> Result<Response, Error> {
+    let user_data = lookup_username(username);
+
+    match user_data {
+        Some(data)
+            if data.status == "active"
+                && data.atproto_state.as_deref() == Some("ready")
+                && data.atproto_did.is_some() =>
+        {
+            let did = data.atproto_did.unwrap();
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "text/plain")
+                .with_header("Access-Control-Allow-Origin", "*")
+                .with_body(did))
+        }
+        _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
+            .with_header(header::CONTENT_TYPE, "text/plain")
+            .with_body("")),
+    }
 }
 
 /// Build NIP-05 response. This is a pure function for easy testing.
@@ -354,6 +389,8 @@ mod tests {
             pubkey: pubkey.to_string(),
             relays,
             status: "active".to_string(),
+            atproto_did: None,
+            atproto_state: None,
         }
     }
 
@@ -362,6 +399,18 @@ mod tests {
             pubkey: pubkey.to_string(),
             relays: vec![],
             status: "inactive".to_string(),
+            atproto_did: None,
+            atproto_state: None,
+        }
+    }
+
+    fn make_atproto_user(pubkey: &str, did: &str, state: &str) -> UsernameData {
+        UsernameData {
+            pubkey: pubkey.to_string(),
+            relays: vec![],
+            status: "active".to_string(),
+            atproto_did: Some(did.to_string()),
+            atproto_state: Some(state.to_string()),
         }
     }
 
@@ -502,5 +551,78 @@ mod tests {
         // 64 chars but not valid hex
         let invalid = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
         assert!(hex_to_npub(invalid).is_err());
+    }
+
+    #[test]
+    fn test_handle_atproto_did_ready_user() {
+        let user = make_atproto_user("abc123pubkey", "did:plc:abc123", "ready");
+        assert_eq!(user.status, "active");
+        assert_eq!(user.atproto_state.as_deref(), Some("ready"));
+        assert_eq!(user.atproto_did.as_deref(), Some("did:plc:abc123"));
+    }
+
+    #[test]
+    fn test_atproto_not_ready() {
+        let user = make_atproto_user("abc123pubkey", "did:plc:abc123", "pending");
+        assert_ne!(user.atproto_state.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn test_atproto_disabled() {
+        let user = make_atproto_user("abc123pubkey", "did:plc:abc123", "disabled");
+        assert_ne!(user.atproto_state.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn test_atproto_no_did() {
+        let user = make_active_user("abc123pubkey", vec![]);
+        assert!(user.atproto_did.is_none());
+    }
+
+    #[test]
+    fn test_atproto_inactive_user() {
+        let mut user = make_atproto_user("abc123pubkey", "did:plc:abc123", "ready");
+        user.status = "revoked".to_string();
+        assert_ne!(user.status, "active");
+    }
+
+    #[test]
+    fn test_nip05_still_works_with_atproto_fields() {
+        let user = make_atproto_user("abc123pubkey", "did:plc:abc123", "ready");
+        let response = build_nip05_response("_", Some(&user));
+        assert_eq!(response.names.get("_"), Some(&"abc123pubkey".to_string()));
+    }
+
+    #[test]
+    fn test_username_data_deserialize_without_atproto() {
+        let json = r#"{"pubkey":"abc123","relays":[],"status":"active"}"#;
+        let data: UsernameData = serde_json::from_str(json).unwrap();
+        assert!(data.atproto_did.is_none());
+        assert!(data.atproto_state.is_none());
+    }
+
+    #[test]
+    fn test_username_data_deserialize_with_atproto() {
+        let json = r#"{"pubkey":"abc123","relays":[],"status":"active","atproto_did":"did:plc:abc123","atproto_state":"ready"}"#;
+        let data: UsernameData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.atproto_did.as_deref(), Some("did:plc:abc123"));
+        assert_eq!(data.atproto_state.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn test_username_data_deserialize_with_null_atproto() {
+        let json = r#"{"pubkey":"abc123","relays":[],"status":"active","atproto_did":null,"atproto_state":null}"#;
+        let data: UsernameData = serde_json::from_str(json).unwrap();
+        assert!(data.atproto_did.is_none());
+        assert!(data.atproto_state.is_none());
+    }
+
+    #[test]
+    fn test_classify_host_new_system_subdomains() {
+        assert_eq!(classify_host("names.divine.video"), HostType::System("names".to_string()));
+        assert_eq!(classify_host("login.divine.video"), HostType::System("login".to_string()));
+        assert_eq!(classify_host("pds.divine.video"), HostType::System("pds".to_string()));
+        assert_eq!(classify_host("feed.divine.video"), HostType::System("feed".to_string()));
+        assert_eq!(classify_host("labeler.divine.video"), HostType::System("labeler".to_string()));
     }
 }
