@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
-const INVITE_BACKEND: &str = "invite_faucet";
+const INVITE_BACKEND: &str = "invite_service";
 const KV_STORE_NAME: &str = "divine-names";
 
 // Subdomains that route to blossom/media server
