@@ -9,10 +9,14 @@ use std::collections::HashSet;
 
 const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
+const INVITE_BACKEND: &str = "invite_faucet";
 const KV_STORE_NAME: &str = "divine-names";
 
 // Subdomains that route to blossom/media server
 const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
+
+// Subdomains that route to invite faucet service
+const INVITE_SUBDOMAINS: &[&str] = &["invite"];
 
 // System subdomains that should passthrough to origin
 const SYSTEM_SUBDOMAINS: &[&str] = &[
@@ -33,6 +37,7 @@ const SYSTEM_SUBDOMAINS: &[&str] = &[
     "pds",
     "feed",
     "labeler",
+    "invite",
 ];
 
 /// Username data stored in KV
@@ -75,8 +80,11 @@ fn main(req: Request) -> Result<Response, Error> {
         HostType::System(subdomain) => {
             // Route to appropriate backend based on subdomain
             let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
+            let invite_set: HashSet<&str> = INVITE_SUBDOMAINS.iter().copied().collect();
             if blossom_set.contains(subdomain.as_str()) {
                 passthrough(req, BLOSSOM_BACKEND)
+            } else if invite_set.contains(subdomain.as_str()) {
+                passthrough(req, INVITE_BACKEND)
             } else {
                 passthrough(req, MAIN_BACKEND)
             }
@@ -137,12 +145,14 @@ fn classify_host(host: &str) -> HostType {
 // Backend host headers - must match what the backend expects
 const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
+const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 
 fn passthrough(req: Request, backend: &str) -> Result<Response, Error> {
     // Set the Host header to what the backend expects
     let backend_host = match backend {
         MAIN_BACKEND => MAIN_BACKEND_HOST,
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
+        INVITE_BACKEND => INVITE_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     };
 
@@ -624,5 +634,12 @@ mod tests {
         assert_eq!(classify_host("pds.divine.video"), HostType::System("pds".to_string()));
         assert_eq!(classify_host("feed.divine.video"), HostType::System("feed".to_string()));
         assert_eq!(classify_host("labeler.divine.video"), HostType::System("labeler".to_string()));
+    }
+
+    #[test]
+    fn test_classify_host_invite_subdomain() {
+        assert_eq!(classify_host("invite.divine.video"), HostType::System("invite".to_string()));
+        assert_eq!(classify_host("invite.dvine.video"), HostType::System("invite".to_string()));
+        assert_eq!(classify_host("invite.dvines.org"), HostType::System("invite".to_string()));
     }
 }
