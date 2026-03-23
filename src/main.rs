@@ -642,4 +642,23 @@ mod tests {
         assert_eq!(classify_host("invite.dvine.video"), HostType::System("invite".to_string()));
         assert_eq!(classify_host("invite.dvines.org"), HostType::System("invite".to_string()));
     }
+
+    #[test]
+    fn test_fastly_manifest_defines_runtime_backends() {
+        let fastly_toml = include_str!("../fastly.toml");
+
+        for backend in [MAIN_BACKEND, BLOSSOM_BACKEND, INVITE_BACKEND] {
+            let local_backend = format!("[local_server.backends.{backend}]");
+            let setup_backend = format!("[setup.backends.{backend}]");
+
+            assert!(
+                fastly_toml.contains(&local_backend),
+                "missing local backend definition for {backend}"
+            );
+            assert!(
+                fastly_toml.contains(&setup_backend),
+                "missing setup backend definition for {backend}"
+            );
+        }
+    }
 }

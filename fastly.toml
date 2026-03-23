@@ -21,7 +21,7 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.blossom]
       url = "https://separately-robust-roughy.edgecompute.app"
 
-    [local_server.backends.invite_faucet]
+    [local_server.backends.invite_service]
       url = "https://adversely-polished-yak.edgecompute.app"
 
   [local_server.kv_stores]
@@ -49,7 +49,7 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
       address = "separately-robust-roughy.edgecompute.app"
       port = 443
 
-    [setup.backends.invite_faucet]
+    [setup.backends.invite_service]
       address = "adversely-polished-yak.edgecompute.app"
       port = 443
 
