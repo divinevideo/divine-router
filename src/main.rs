@@ -6,6 +6,7 @@ use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::Duration;
 
 const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
@@ -71,22 +72,22 @@ fn main(req: Request) -> Result<Response, Error> {
     match classify_host(&host) {
         HostType::Apex => {
             // Main site - passthrough
-            passthrough(req, MAIN_BACKEND)
+            passthrough(req, MAIN_BACKEND, &host)
         }
         HostType::MultiLevel => {
             // Multi-level subdomain (*.admin.dvines.org) - passthrough
-            passthrough(req, MAIN_BACKEND)
+            passthrough(req, MAIN_BACKEND, &host)
         }
         HostType::System(subdomain) => {
             // Route to appropriate backend based on subdomain
             let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
             let invite_set: HashSet<&str> = INVITE_SUBDOMAINS.iter().copied().collect();
             if blossom_set.contains(subdomain.as_str()) {
-                passthrough(req, BLOSSOM_BACKEND)
+                passthrough(req, BLOSSOM_BACKEND, &host)
             } else if invite_set.contains(subdomain.as_str()) {
-                passthrough(req, INVITE_BACKEND)
+                passthrough(req, INVITE_BACKEND, &host)
             } else {
-                passthrough(req, MAIN_BACKEND)
+                passthrough(req, MAIN_BACKEND, &host)
             }
         }
         HostType::Username(username) => {
@@ -147,7 +148,44 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 
-fn passthrough(req: Request, backend: &str) -> Result<Response, Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApiCachePolicy {
+    cacheable: bool,
+    fallback_ttl_secs: Option<u32>,
+}
+
+fn api_cache_policy(
+    host: &str,
+    method: &str,
+    path: &str,
+    has_authorization: bool,
+    is_websocket_upgrade: bool,
+) -> ApiCachePolicy {
+    let is_api_host = matches!(
+        classify_host(host),
+        HostType::System(ref subdomain) if subdomain == "relay" || subdomain == "api"
+    );
+    let is_cacheable_api_path = path.starts_with("/api/") && !path.starts_with("/api/docs");
+
+    if !is_api_host
+        || !is_cacheable_api_path
+        || !method.eq_ignore_ascii_case("GET")
+        || has_authorization
+        || is_websocket_upgrade
+    {
+        return ApiCachePolicy {
+            cacheable: false,
+            fallback_ttl_secs: None,
+        };
+    }
+
+    ApiCachePolicy {
+        cacheable: true,
+        fallback_ttl_secs: Some(30),
+    }
+}
+
+fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
     // Set the Host header to what the backend expects
     let backend_host = match backend {
         MAIN_BACKEND => MAIN_BACKEND_HOST,
@@ -157,6 +195,37 @@ fn passthrough(req: Request, backend: &str) -> Result<Response, Error> {
     };
 
     let mut req = req;
+    let path = req.get_path().to_string();
+    let has_authorization = req.contains_header(header::AUTHORIZATION);
+    let is_websocket_upgrade = req
+        .get_header_str(header::UPGRADE)
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let policy = api_cache_policy(
+        original_host,
+        req.get_method_str(),
+        &path,
+        has_authorization,
+        is_websocket_upgrade,
+    );
+
+    if is_websocket_upgrade {
+        req.set_pass(true);
+    } else if path.starts_with("/api/") {
+        if policy.cacheable {
+            if let Some(ttl_secs) = policy.fallback_ttl_secs {
+                req.set_after_send(move |candidate| {
+                    if !candidate.contains_header("surrogate-control") {
+                        candidate.set_ttl(Duration::from_secs(ttl_secs as u64));
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            req.set_pass(true);
+        }
+    }
+
     req.set_header(header::HOST, backend_host);
     Ok(req.send(backend)?)
 }
@@ -252,10 +321,7 @@ fn handle_atproto_did(username: &str) -> Result<Response, Error> {
 ///
 /// For subdomain requests, the caller looks up the subdomain username in KV,
 /// but this function uses `queried_name` in the response.
-fn build_nip05_response(
-    queried_name: &str,
-    user_data: Option<&UsernameData>,
-) -> Nip05Response {
+fn build_nip05_response(queried_name: &str, user_data: Option<&UsernameData>) -> Nip05Response {
     match user_data {
         Some(data) if data.status == "active" => {
             let mut names = std::collections::HashMap::new();
@@ -309,10 +375,7 @@ fn serve_profile(_username: &str, _data: &UsernameData, req: Request) -> Result<
     // Forward to divine-web backend with X-Original-Host header.
     // The divine-web edge worker handles subdomain profiles by injecting
     // window.__DIVINE_USER__ into the SPA HTML and serving it directly.
-    let original_host = req
-        .get_header_str("host")
-        .unwrap_or("")
-        .to_string();
+    let original_host = req.get_header_str("host").unwrap_or("").to_string();
 
     let mut req = req;
     req.set_header(header::HOST, MAIN_BACKEND_HOST);
@@ -327,7 +390,7 @@ fn hex_to_npub(hex: &str) -> Result<String, ()> {
     }
 
     let data: Vec<u8> = (0..32)
-        .map(|i| u8::from_str_radix(&hex[i*2..i*2+2], 16))
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
         .collect::<Result<Vec<u8>, _>>()
         .map_err(|_| ())?;
 
@@ -350,7 +413,8 @@ fn hex_to_npub(hex: &str) -> Result<String, ()> {
 
     // Bech32 checksum
     let hrp = "npub";
-    let hrp_expand: Vec<u8> = hrp.chars()
+    let hrp_expand: Vec<u8> = hrp
+        .chars()
         .map(|c| c as u8 >> 5)
         .chain(std::iter::once(0))
         .chain(hrp.chars().map(|c| c as u8 & 31))
@@ -387,7 +451,9 @@ fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
     }
     chk ^= 1;
 
-    (0..6).map(|i| ((chk >> (5 * (5 - i))) & 31) as u8).collect()
+    (0..6)
+        .map(|i| ((chk >> (5 * (5 - i))) & 31) as u8)
+        .collect()
 }
 
 #[cfg(test)]
@@ -445,7 +511,10 @@ mod tests {
         let response = build_nip05_response("daniel", Some(&user));
 
         assert_eq!(response.names.len(), 1);
-        assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
+        assert_eq!(
+            response.names.get("daniel"),
+            Some(&"abc123pubkey".to_string())
+        );
     }
 
     #[test]
@@ -486,7 +555,10 @@ mod tests {
         let user = make_active_user("abc123pubkey", vec![]);
         let response = build_nip05_response("DANIEL", Some(&user));
 
-        assert_eq!(response.names.get("daniel"), Some(&"abc123pubkey".to_string()));
+        assert_eq!(
+            response.names.get("daniel"),
+            Some(&"abc123pubkey".to_string())
+        );
         assert!(!response.names.contains_key("DANIEL"));
     }
 
@@ -500,29 +572,56 @@ mod tests {
     #[test]
     fn test_classify_host_with_port() {
         assert_eq!(classify_host("divine.video:443"), HostType::Apex);
-        assert_eq!(classify_host("daniel.divine.video:8080"), HostType::Username("daniel".to_string()));
+        assert_eq!(
+            classify_host("daniel.divine.video:8080"),
+            HostType::Username("daniel".to_string())
+        );
     }
 
     #[test]
     fn test_classify_host_system_subdomain() {
-        assert_eq!(classify_host("www.divine.video"), HostType::System("www".to_string()));
-        assert_eq!(classify_host("api.divine.video"), HostType::System("api".to_string()));
-        assert_eq!(classify_host("relay.divine.video"), HostType::System("relay".to_string()));
-        assert_eq!(classify_host("media.divine.video"), HostType::System("media".to_string()));
+        assert_eq!(
+            classify_host("www.divine.video"),
+            HostType::System("www".to_string())
+        );
+        assert_eq!(
+            classify_host("api.divine.video"),
+            HostType::System("api".to_string())
+        );
+        assert_eq!(
+            classify_host("relay.divine.video"),
+            HostType::System("relay".to_string())
+        );
+        assert_eq!(
+            classify_host("media.divine.video"),
+            HostType::System("media".to_string())
+        );
     }
 
     #[test]
     fn test_classify_host_username_subdomain() {
-        assert_eq!(classify_host("daniel.divine.video"), HostType::Username("daniel".to_string()));
-        assert_eq!(classify_host("alice.dvine.video"), HostType::Username("alice".to_string()));
-        assert_eq!(classify_host("bob.dvines.org"), HostType::Username("bob".to_string()));
+        assert_eq!(
+            classify_host("daniel.divine.video"),
+            HostType::Username("daniel".to_string())
+        );
+        assert_eq!(
+            classify_host("alice.dvine.video"),
+            HostType::Username("alice".to_string())
+        );
+        assert_eq!(
+            classify_host("bob.dvines.org"),
+            HostType::Username("bob".to_string())
+        );
     }
 
     #[test]
     fn test_classify_host_username_case_insensitive() {
         // Subdomain is lowercased, but domain check is case-sensitive
         // (hostnames come lowercase from HTTP headers in practice)
-        assert_eq!(classify_host("DANIEL.divine.video"), HostType::Username("daniel".to_string()));
+        assert_eq!(
+            classify_host("DANIEL.divine.video"),
+            HostType::Username("daniel".to_string())
+        );
     }
 
     #[test]
@@ -629,18 +728,42 @@ mod tests {
 
     #[test]
     fn test_classify_host_new_system_subdomains() {
-        assert_eq!(classify_host("names.divine.video"), HostType::System("names".to_string()));
-        assert_eq!(classify_host("login.divine.video"), HostType::System("login".to_string()));
-        assert_eq!(classify_host("pds.divine.video"), HostType::System("pds".to_string()));
-        assert_eq!(classify_host("feed.divine.video"), HostType::System("feed".to_string()));
-        assert_eq!(classify_host("labeler.divine.video"), HostType::System("labeler".to_string()));
+        assert_eq!(
+            classify_host("names.divine.video"),
+            HostType::System("names".to_string())
+        );
+        assert_eq!(
+            classify_host("login.divine.video"),
+            HostType::System("login".to_string())
+        );
+        assert_eq!(
+            classify_host("pds.divine.video"),
+            HostType::System("pds".to_string())
+        );
+        assert_eq!(
+            classify_host("feed.divine.video"),
+            HostType::System("feed".to_string())
+        );
+        assert_eq!(
+            classify_host("labeler.divine.video"),
+            HostType::System("labeler".to_string())
+        );
     }
 
     #[test]
     fn test_classify_host_invite_subdomain() {
-        assert_eq!(classify_host("invite.divine.video"), HostType::System("invite".to_string()));
-        assert_eq!(classify_host("invite.dvine.video"), HostType::System("invite".to_string()));
-        assert_eq!(classify_host("invite.dvines.org"), HostType::System("invite".to_string()));
+        assert_eq!(
+            classify_host("invite.divine.video"),
+            HostType::System("invite".to_string())
+        );
+        assert_eq!(
+            classify_host("invite.dvine.video"),
+            HostType::System("invite".to_string())
+        );
+        assert_eq!(
+            classify_host("invite.dvines.org"),
+            HostType::System("invite".to_string())
+        );
     }
 
     #[test]
@@ -660,5 +783,61 @@ mod tests {
                 "missing setup backend definition for {backend}"
             );
         }
+    }
+
+    #[test]
+    fn test_api_cache_policy_caches_public_relay_get_requests() {
+        let policy = api_cache_policy("relay.divine.video", "GET", "/api/search", false, false);
+
+        assert!(policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_non_get_requests() {
+        let policy = api_cache_policy("relay.divine.video", "POST", "/api/search", false, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_authorized_requests() {
+        let policy = api_cache_policy("relay.divine.video", "GET", "/api/search", true, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_api_docs() {
+        let policy = api_cache_policy("relay.divine.video", "GET", "/api/docs", false, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_websocket_upgrades() {
+        let policy = api_cache_policy("relay.divine.video", "GET", "/api/search", false, true);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_non_api_hosts() {
+        let policy = api_cache_policy("www.divine.video", "GET", "/api/search", false, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_api_cache_policy_caches_api_subdomain() {
+        let policy = api_cache_policy("api.divine.video", "GET", "/api/search", false, false);
+
+        assert!(policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, Some(30));
     }
 }
