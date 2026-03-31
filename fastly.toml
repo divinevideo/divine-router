@@ -24,6 +24,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.invite_service]
       url = "https://adversely-polished-yak.edgecompute.app"
 
+    [local_server.backends.funnelcake_api]
+      url = "https://relay.divine.video"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.usernames]
@@ -51,6 +54,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.invite_service]
       address = "adversely-polished-yak.edgecompute.app"
+      port = 443
+
+    [setup.backends.funnelcake_api]
+      address = "relay.divine.video"
       port = 443
 
   [setup.kv_stores]

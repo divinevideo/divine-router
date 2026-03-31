@@ -11,6 +11,7 @@ use std::time::Duration;
 const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
+const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const KV_STORE_NAME: &str = "divine-names";
 
 // Subdomains that route to blossom/media server
@@ -86,6 +87,8 @@ fn main(req: Request) -> Result<Response, Error> {
                 passthrough(req, BLOSSOM_BACKEND, &host)
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
+            } else if subdomain == "api" {
+                passthrough(req, FUNNELCAKE_API_BACKEND, &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -191,6 +194,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         MAIN_BACKEND => MAIN_BACKEND_HOST,
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
+        FUNNELCAKE_API_BACKEND => "relay.divine.video",
         _ => MAIN_BACKEND_HOST,
     };
 
@@ -226,19 +230,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    // For api.divine.video, rewrite Host to relay.divine.video so GKE's
-    // HTTPRoute matches the funnelcake-api service (which has surrogate headers)
-    let host_header = if path.starts_with("/api/")
-        && matches!(
-            classify_host(original_host),
-            HostType::System(ref s) if s == "api"
-        )
-    {
-        "relay.divine.video"
-    } else {
-        backend_host
-    };
-    req.set_header(header::HOST, host_header);
+    req.set_header(header::HOST, backend_host);
     Ok(req.send(backend)?)
 }
 
@@ -782,7 +774,7 @@ mod tests {
     fn test_fastly_manifest_defines_runtime_backends() {
         let fastly_toml = include_str!("../fastly.toml");
 
-        for backend in [MAIN_BACKEND, BLOSSOM_BACKEND, INVITE_BACKEND] {
+        for backend in [MAIN_BACKEND, BLOSSOM_BACKEND, INVITE_BACKEND, FUNNELCAKE_API_BACKEND] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
 
