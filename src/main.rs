@@ -226,7 +226,19 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    req.set_header(header::HOST, backend_host);
+    // For api.divine.video, rewrite Host to relay.divine.video so GKE's
+    // HTTPRoute matches the funnelcake-api service (which has surrogate headers)
+    let host_header = if path.starts_with("/api/")
+        && matches!(
+            classify_host(original_host),
+            HostType::System(ref s) if s == "api"
+        )
+    {
+        "relay.divine.video"
+    } else {
+        backend_host
+    };
+    req.set_header(header::HOST, host_header);
     Ok(req.send(backend)?)
 }
 
