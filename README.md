@@ -2,6 +2,8 @@
 
 Fastly Compute@Edge router for wildcard subdomain routing on Divine Video.
 
+This is the public edge, not the ArgoCD-managed GKE stack. Production ATProto rollout depends on this service being published separately from `divine-iac-coreconfig`.
+
 ## Overview
 
 This edge router handles incoming requests to `*.divine.video`, `*.dvine.video`, and `*.dvines.org`, routing them based on the subdomain:
@@ -50,6 +52,8 @@ fastly compute serve
 ```bash
 fastly compute publish --non-interactive && fastly purge --all
 ```
+
+Deploy this after the public handle state has been published by `divine-name-server`, because it reads Fastly KV to serve `/.well-known/atproto-did`.
 
 ## Configuration
 
