@@ -150,6 +150,36 @@ fn classify_host(host: &str) -> HostType {
 const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
+const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughHeaders<'a> {
+    backend_host: &'static str,
+    forwarded_host: &'a str,
+    forwarded_proto: &'a str,
+}
+
+fn backend_host_for(backend: &str) -> &'static str {
+    match backend {
+        MAIN_BACKEND => MAIN_BACKEND_HOST,
+        BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
+        INVITE_BACKEND => INVITE_BACKEND_HOST,
+        FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        _ => MAIN_BACKEND_HOST,
+    }
+}
+
+fn passthrough_headers<'a>(
+    backend: &str,
+    original_host: &'a str,
+    original_proto: &'a str,
+) -> PassthroughHeaders<'a> {
+    PassthroughHeaders {
+        backend_host: backend_host_for(backend),
+        forwarded_host: original_host,
+        forwarded_proto: original_proto,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ApiCachePolicy {
@@ -164,10 +194,8 @@ fn api_cache_policy(
     has_authorization: bool,
     is_websocket_upgrade: bool,
 ) -> ApiCachePolicy {
-    let is_api_host = matches!(
-        classify_host(host),
-        HostType::System(ref subdomain) if subdomain == "relay" || subdomain == "api"
-    );
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
     let is_cacheable_api_path = path.starts_with("/api/") && !path.starts_with("/api/docs");
 
     if !is_api_host
@@ -189,17 +217,13 @@ fn api_cache_policy(
 }
 
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
-    // Set the Host header to what the backend expects
-    let backend_host = match backend {
-        MAIN_BACKEND => MAIN_BACKEND_HOST,
-        BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
-        INVITE_BACKEND => INVITE_BACKEND_HOST,
-        FUNNELCAKE_API_BACKEND => "relay.divine.video",
-        _ => MAIN_BACKEND_HOST,
-    };
-
     let mut req = req;
     let path = req.get_path().to_string();
+    let request_scheme: &'static str = match req.get_url().scheme() {
+        "http" => "http",
+        _ => "https",
+    };
+    let headers = passthrough_headers(backend, original_host, request_scheme);
     let has_authorization = req.contains_header(header::AUTHORIZATION);
     let is_websocket_upgrade = req
         .get_header_str(header::UPGRADE)
@@ -230,7 +254,9 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    req.set_header(header::HOST, backend_host);
+    req.set_header(header::HOST, headers.backend_host);
+    req.set_header("X-Forwarded-Host", headers.forwarded_host);
+    req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
     Ok(req.send(backend)?)
 }
 
@@ -774,7 +800,12 @@ mod tests {
     fn test_fastly_manifest_defines_runtime_backends() {
         let fastly_toml = include_str!("../fastly.toml");
 
-        for backend in [MAIN_BACKEND, BLOSSOM_BACKEND, INVITE_BACKEND, FUNNELCAKE_API_BACKEND] {
+        for backend in [
+            MAIN_BACKEND,
+            BLOSSOM_BACKEND,
+            INVITE_BACKEND,
+            FUNNELCAKE_API_BACKEND,
+        ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
 
@@ -790,11 +821,11 @@ mod tests {
     }
 
     #[test]
-    fn test_api_cache_policy_caches_public_relay_get_requests() {
+    fn test_api_cache_policy_skips_public_relay_get_requests() {
         let policy = api_cache_policy("relay.divine.video", "GET", "/api/search", false, false);
 
-        assert!(policy.cacheable);
-        assert_eq!(policy.fallback_ttl_secs, Some(30));
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
     }
 
     #[test]
@@ -843,5 +874,29 @@ mod tests {
 
         assert!(policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_passthrough_headers_preserve_original_api_host_for_funnelcake_backend() {
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
+
+        assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.forwarded_host, "api.divine.video");
+        assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_passthrough_headers_pass_through_http_scheme() {
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "http");
+
+        assert_eq!(headers.forwarded_proto, "http");
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_post_publish_on_api_host() {
+        let policy = api_cache_policy("api.divine.video", "POST", "/api/events", false, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
     }
 }
