@@ -187,6 +187,19 @@ struct ApiCachePolicy {
     fallback_ttl_secs: Option<u32>,
 }
 
+fn is_public_divine_host(host: &str) -> bool {
+    let hostname = host.split(':').next().unwrap_or(host);
+
+    hostname.eq_ignore_ascii_case("divine.video")
+        || hostname.eq_ignore_ascii_case("dvine.video")
+        || hostname.eq_ignore_ascii_case("dvines.org")
+        || matches!(classify_host(host), HostType::System(_))
+}
+
+fn should_bypass_cache(host: &str, path: &str) -> bool {
+    path.starts_with("/.well-known/") && is_public_divine_host(host)
+}
+
 fn api_cache_policy(
     host: &str,
     method: &str,
@@ -237,7 +250,9 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         is_websocket_upgrade,
     );
 
-    if is_websocket_upgrade {
+    if should_bypass_cache(original_host, &path) {
+        req.set_pass(true);
+    } else if is_websocket_upgrade {
         req.set_pass(true);
     } else if path.starts_with("/api/") {
         if policy.cacheable {
@@ -898,5 +913,62 @@ mod tests {
 
         assert!(!policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_should_bypass_cache_for_public_well_known_paths() {
+        assert!(should_bypass_cache(
+            "divine.video",
+            "/.well-known/apple-app-site-association"
+        ));
+        assert!(should_bypass_cache(
+            "dvines.org",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "divine.video:443",
+            "/.well-known/apple-app-site-association"
+        ));
+        assert!(should_bypass_cache(
+            "www.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "api.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "login.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_bypass_cache_for_username_unknown_or_multi_level_hosts() {
+        assert!(!should_bypass_cache(
+            "alice.divine.video",
+            "/.well-known/nostr.json"
+        ));
+        assert!(!should_bypass_cache(
+            "foo.bar.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(!should_bypass_cache(
+            "example.com",
+            "/.well-known/assetlinks.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_bypass_cache_for_non_well_known_paths() {
+        assert!(!should_bypass_cache("divine.video", "/api/search"));
+    }
+
+    #[test]
+    fn test_is_public_divine_host_excludes_unknown_domains() {
+        assert!(is_public_divine_host("divine.video"));
+        assert!(is_public_divine_host("www.divine.video"));
+        assert!(!is_public_divine_host("example.com"));
+        assert!(!is_public_divine_host("foo.example.com"));
     }
 }
