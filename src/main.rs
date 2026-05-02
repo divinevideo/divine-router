@@ -189,7 +189,7 @@ struct ApiCachePolicy {
 
 fn should_bypass_cache(host: &str, path: &str) -> bool {
     path.starts_with("/.well-known/")
-        && !matches!(classify_host(host), HostType::Username(_))
+        && matches!(classify_host(host), HostType::Apex | HostType::System(_))
 }
 
 fn api_cache_policy(
@@ -914,7 +914,15 @@ mod tests {
             "/.well-known/apple-app-site-association"
         ));
         assert!(should_bypass_cache(
+            "divine.video:443",
+            "/.well-known/apple-app-site-association"
+        ));
+        assert!(should_bypass_cache(
             "www.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "api.divine.video",
             "/.well-known/assetlinks.json"
         ));
         assert!(should_bypass_cache(
@@ -924,11 +932,23 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_bypass_cache_for_username_or_non_well_known_paths() {
+    fn test_should_not_bypass_cache_for_username_unknown_or_multi_level_hosts() {
         assert!(!should_bypass_cache(
             "alice.divine.video",
             "/.well-known/nostr.json"
         ));
+        assert!(!should_bypass_cache(
+            "foo.bar.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(!should_bypass_cache(
+            "example.com",
+            "/.well-known/assetlinks.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_bypass_cache_for_non_well_known_paths() {
         assert!(!should_bypass_cache("divine.video", "/api/search"));
     }
 }
