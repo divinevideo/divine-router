@@ -187,9 +187,17 @@ struct ApiCachePolicy {
     fallback_ttl_secs: Option<u32>,
 }
 
+fn is_public_divine_host(host: &str) -> bool {
+    let hostname = host.split(':').next().unwrap_or(host);
+
+    hostname.eq_ignore_ascii_case("divine.video")
+        || hostname.eq_ignore_ascii_case("dvine.video")
+        || hostname.eq_ignore_ascii_case("dvines.org")
+        || matches!(classify_host(host), HostType::System(_))
+}
+
 fn should_bypass_cache(host: &str, path: &str) -> bool {
-    path.starts_with("/.well-known/")
-        && matches!(classify_host(host), HostType::Apex | HostType::System(_))
+    path.starts_with("/.well-known/") && is_public_divine_host(host)
 }
 
 fn api_cache_policy(
@@ -914,6 +922,10 @@ mod tests {
             "/.well-known/apple-app-site-association"
         ));
         assert!(should_bypass_cache(
+            "dvines.org",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
             "divine.video:443",
             "/.well-known/apple-app-site-association"
         ));
@@ -950,5 +962,13 @@ mod tests {
     #[test]
     fn test_should_not_bypass_cache_for_non_well_known_paths() {
         assert!(!should_bypass_cache("divine.video", "/api/search"));
+    }
+
+    #[test]
+    fn test_is_public_divine_host_excludes_unknown_domains() {
+        assert!(is_public_divine_host("divine.video"));
+        assert!(is_public_divine_host("www.divine.video"));
+        assert!(!is_public_divine_host("example.com"));
+        assert!(!is_public_divine_host("foo.example.com"));
     }
 }
