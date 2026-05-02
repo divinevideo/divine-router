@@ -119,7 +119,6 @@ fn classify_host(host: &str) -> HostType {
         let sld = parts[parts.len() - 2];
         (sld == "dvines" && tld == "org")
             || (sld == "divine" && tld == "video")
-            || (sld == "dvine" && tld == "video")
     };
 
     if !is_our_domain {
@@ -191,7 +190,6 @@ fn is_public_divine_host(host: &str) -> bool {
     let hostname = host.split(':').next().unwrap_or(host);
 
     hostname.eq_ignore_ascii_case("divine.video")
-        || hostname.eq_ignore_ascii_case("dvine.video")
         || hostname.eq_ignore_ascii_case("dvines.org")
         || matches!(classify_host(host), HostType::System(_))
 }
@@ -610,7 +608,6 @@ mod tests {
     #[test]
     fn test_classify_host_apex() {
         assert_eq!(classify_host("divine.video"), HostType::Apex);
-        assert_eq!(classify_host("dvine.video"), HostType::Apex);
         assert_eq!(classify_host("dvines.org"), HostType::Apex);
     }
 
@@ -648,10 +645,6 @@ mod tests {
         assert_eq!(
             classify_host("daniel.divine.video"),
             HostType::Username("daniel".to_string())
-        );
-        assert_eq!(
-            classify_host("alice.dvine.video"),
-            HostType::Username("alice".to_string())
         );
         assert_eq!(
             classify_host("bob.dvines.org"),
@@ -799,10 +792,6 @@ mod tests {
     fn test_classify_host_invite_subdomain() {
         assert_eq!(
             classify_host("invite.divine.video"),
-            HostType::System("invite".to_string())
-        );
-        assert_eq!(
-            classify_host("invite.dvine.video"),
             HostType::System("invite".to_string())
         );
         assert_eq!(

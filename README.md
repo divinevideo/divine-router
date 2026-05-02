@@ -6,7 +6,7 @@ This is the public edge, not the ArgoCD-managed GKE stack. Production ATProto ro
 
 ## Overview
 
-This edge router handles incoming requests to `*.divine.video`, `*.dvine.video`, and `*.dvines.org`, routing them based on the subdomain:
+This edge router handles incoming requests to `*.divine.video` and `*.dvines.org`, routing them based on the subdomain:
 
 - **Apex domains** (divine.video, dvines.org) → passthrough to origin
 - **System subdomains** (www, api, cdn, admin, etc.) → passthrough to origin
