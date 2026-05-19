@@ -27,6 +27,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.funnelcake_api]
       url = "https://relay.divine.video"
 
+    [local_server.backends.sound_proxy]
+      url = "https://divine-sound-proxy.edgecompute.app"
+
     [local_server.backends.activitypub_gateway]
       url = "https://divine-activity-pub.protestnet.workers.dev"
 
@@ -61,6 +64,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.funnelcake_api]
       address = "relay.divine.video"
+      port = 443
+
+    [setup.backends.sound_proxy]
+      address = "divine-sound-proxy.edgecompute.app"
       port = 443
 
     [setup.backends.activitypub_gateway]
