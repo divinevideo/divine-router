@@ -12,7 +12,19 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+
+// ActivityPub gateway paths served on the divine.video apex by the
+// divine-activity-pub worker (actors, outbox, inbox, webfinger, nodeinfo).
+fn is_activitypub_path(path: &str) -> bool {
+    path == "/ap"
+        || path.starts_with("/ap/")
+        || path.starts_with("/.well-known/webfinger")
+        || path == "/.well-known/nodeinfo"
+        || path == "/nodeinfo"
+        || path.starts_with("/nodeinfo/")
+}
 
 // Subdomains that route to blossom/media server
 const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
@@ -68,6 +80,17 @@ struct Nip05Response {
 fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
+
+    // ActivityPub gateway: route /ap/*, webfinger, and nodeinfo on the divine.video
+    // (or dvines.org) apex to the divine-activity-pub worker. Everything else is
+    // untouched. NOTE: leaves /.well-known/nostr.json and /.well-known/atproto-did
+    // on the main backend (only /.well-known/webfinger is diverted).
+    let hostname_only = host.split(':').next().unwrap_or(&host);
+    let is_apex_divine = hostname_only.eq_ignore_ascii_case("divine.video")
+        || hostname_only.eq_ignore_ascii_case("dvines.org");
+    if is_apex_divine && is_activitypub_path(&path) {
+        return passthrough(req, ACTIVITYPUB_BACKEND, &host);
+    }
 
     // Parse hostname to determine routing
     match classify_host(&host) {
@@ -150,6 +173,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughHeaders<'a> {
@@ -164,6 +188,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
 }
@@ -195,7 +220,8 @@ fn is_public_divine_host(host: &str) -> bool {
 }
 
 fn should_bypass_cache(host: &str, path: &str) -> bool {
-    path.starts_with("/.well-known/") && is_public_divine_host(host)
+    is_public_divine_host(host)
+        && (path.starts_with("/.well-known/") || is_activitypub_path(path))
 }
 
 fn api_cache_policy(
