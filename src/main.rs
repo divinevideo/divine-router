@@ -119,7 +119,6 @@ fn classify_host(host: &str) -> HostType {
         let sld = parts[parts.len() - 2];
         (sld == "dvines" && tld == "org")
             || (sld == "divine" && tld == "video")
-            || (sld == "dvine" && tld == "video")
     };
 
     if !is_our_domain {
@@ -150,11 +149,53 @@ fn classify_host(host: &str) -> HostType {
 const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
+const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughHeaders<'a> {
+    backend_host: &'static str,
+    forwarded_host: &'a str,
+    forwarded_proto: &'a str,
+}
+
+fn backend_host_for(backend: &str) -> &'static str {
+    match backend {
+        MAIN_BACKEND => MAIN_BACKEND_HOST,
+        BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
+        INVITE_BACKEND => INVITE_BACKEND_HOST,
+        FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        _ => MAIN_BACKEND_HOST,
+    }
+}
+
+fn passthrough_headers<'a>(
+    backend: &str,
+    original_host: &'a str,
+    original_proto: &'a str,
+) -> PassthroughHeaders<'a> {
+    PassthroughHeaders {
+        backend_host: backend_host_for(backend),
+        forwarded_host: original_host,
+        forwarded_proto: original_proto,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ApiCachePolicy {
     cacheable: bool,
     fallback_ttl_secs: Option<u32>,
+}
+
+fn is_public_divine_host(host: &str) -> bool {
+    let hostname = host.split(':').next().unwrap_or(host);
+
+    hostname.eq_ignore_ascii_case("divine.video")
+        || hostname.eq_ignore_ascii_case("dvines.org")
+        || matches!(classify_host(host), HostType::System(_))
+}
+
+fn should_bypass_cache(host: &str, path: &str) -> bool {
+    path.starts_with("/.well-known/") && is_public_divine_host(host)
 }
 
 fn api_cache_policy(
@@ -164,10 +205,8 @@ fn api_cache_policy(
     has_authorization: bool,
     is_websocket_upgrade: bool,
 ) -> ApiCachePolicy {
-    let is_api_host = matches!(
-        classify_host(host),
-        HostType::System(ref subdomain) if subdomain == "relay" || subdomain == "api"
-    );
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
     let is_cacheable_api_path = path.starts_with("/api/") && !path.starts_with("/api/docs");
 
     if !is_api_host
@@ -189,17 +228,13 @@ fn api_cache_policy(
 }
 
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
-    // Set the Host header to what the backend expects
-    let backend_host = match backend {
-        MAIN_BACKEND => MAIN_BACKEND_HOST,
-        BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
-        INVITE_BACKEND => INVITE_BACKEND_HOST,
-        FUNNELCAKE_API_BACKEND => "relay.divine.video",
-        _ => MAIN_BACKEND_HOST,
-    };
-
     let mut req = req;
     let path = req.get_path().to_string();
+    let request_scheme: &'static str = match req.get_url().scheme() {
+        "http" => "http",
+        _ => "https",
+    };
+    let headers = passthrough_headers(backend, original_host, request_scheme);
     let has_authorization = req.contains_header(header::AUTHORIZATION);
     let is_websocket_upgrade = req
         .get_header_str(header::UPGRADE)
@@ -213,7 +248,9 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         is_websocket_upgrade,
     );
 
-    if is_websocket_upgrade {
+    if should_bypass_cache(original_host, &path) {
+        req.set_pass(true);
+    } else if is_websocket_upgrade {
         req.set_pass(true);
     } else if path.starts_with("/api/") {
         if policy.cacheable {
@@ -230,7 +267,9 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    req.set_header(header::HOST, backend_host);
+    req.set_header(header::HOST, headers.backend_host);
+    req.set_header("X-Forwarded-Host", headers.forwarded_host);
+    req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
     Ok(req.send(backend)?)
 }
 
@@ -569,7 +608,6 @@ mod tests {
     #[test]
     fn test_classify_host_apex() {
         assert_eq!(classify_host("divine.video"), HostType::Apex);
-        assert_eq!(classify_host("dvine.video"), HostType::Apex);
         assert_eq!(classify_host("dvines.org"), HostType::Apex);
     }
 
@@ -607,10 +645,6 @@ mod tests {
         assert_eq!(
             classify_host("daniel.divine.video"),
             HostType::Username("daniel".to_string())
-        );
-        assert_eq!(
-            classify_host("alice.dvine.video"),
-            HostType::Username("alice".to_string())
         );
         assert_eq!(
             classify_host("bob.dvines.org"),
@@ -761,10 +795,6 @@ mod tests {
             HostType::System("invite".to_string())
         );
         assert_eq!(
-            classify_host("invite.dvine.video"),
-            HostType::System("invite".to_string())
-        );
-        assert_eq!(
             classify_host("invite.dvines.org"),
             HostType::System("invite".to_string())
         );
@@ -774,7 +804,12 @@ mod tests {
     fn test_fastly_manifest_defines_runtime_backends() {
         let fastly_toml = include_str!("../fastly.toml");
 
-        for backend in [MAIN_BACKEND, BLOSSOM_BACKEND, INVITE_BACKEND, FUNNELCAKE_API_BACKEND] {
+        for backend in [
+            MAIN_BACKEND,
+            BLOSSOM_BACKEND,
+            INVITE_BACKEND,
+            FUNNELCAKE_API_BACKEND,
+        ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
 
@@ -790,11 +825,11 @@ mod tests {
     }
 
     #[test]
-    fn test_api_cache_policy_caches_public_relay_get_requests() {
+    fn test_api_cache_policy_skips_public_relay_get_requests() {
         let policy = api_cache_policy("relay.divine.video", "GET", "/api/search", false, false);
 
-        assert!(policy.cacheable);
-        assert_eq!(policy.fallback_ttl_secs, Some(30));
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
     }
 
     #[test]
@@ -843,5 +878,86 @@ mod tests {
 
         assert!(policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_passthrough_headers_preserve_original_api_host_for_funnelcake_backend() {
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
+
+        assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.forwarded_host, "api.divine.video");
+        assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_passthrough_headers_pass_through_http_scheme() {
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "http");
+
+        assert_eq!(headers.forwarded_proto, "http");
+    }
+
+    #[test]
+    fn test_api_cache_policy_skips_post_publish_on_api_host() {
+        let policy = api_cache_policy("api.divine.video", "POST", "/api/events", false, false);
+
+        assert!(!policy.cacheable);
+        assert_eq!(policy.fallback_ttl_secs, None);
+    }
+
+    #[test]
+    fn test_should_bypass_cache_for_public_well_known_paths() {
+        assert!(should_bypass_cache(
+            "divine.video",
+            "/.well-known/apple-app-site-association"
+        ));
+        assert!(should_bypass_cache(
+            "dvines.org",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "divine.video:443",
+            "/.well-known/apple-app-site-association"
+        ));
+        assert!(should_bypass_cache(
+            "www.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "api.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(should_bypass_cache(
+            "login.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_bypass_cache_for_username_unknown_or_multi_level_hosts() {
+        assert!(!should_bypass_cache(
+            "alice.divine.video",
+            "/.well-known/nostr.json"
+        ));
+        assert!(!should_bypass_cache(
+            "foo.bar.divine.video",
+            "/.well-known/assetlinks.json"
+        ));
+        assert!(!should_bypass_cache(
+            "example.com",
+            "/.well-known/assetlinks.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_not_bypass_cache_for_non_well_known_paths() {
+        assert!(!should_bypass_cache("divine.video", "/api/search"));
+    }
+
+    #[test]
+    fn test_is_public_divine_host_excludes_unknown_domains() {
+        assert!(is_public_divine_host("divine.video"));
+        assert!(is_public_divine_host("www.divine.video"));
+        assert!(!is_public_divine_host("example.com"));
+        assert!(!is_public_divine_host("foo.example.com"));
     }
 }
