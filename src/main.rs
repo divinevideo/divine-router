@@ -16,11 +16,11 @@ const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
 
 // ActivityPub gateway paths served on the divine.video apex by the
-// divine-activity-pub worker (actors, outbox, inbox, webfinger, nodeinfo).
+// divine-activity-pub worker (actors, outbox, inbox, nodeinfo). NOTE: WebFinger
+// is NOT here — the router serves it directly from the username KV (handle_webfinger).
 fn is_activitypub_path(path: &str) -> bool {
     path == "/ap"
         || path.starts_with("/ap/")
-        || path.starts_with("/.well-known/webfinger")
         || path == "/.well-known/nodeinfo"
         || path == "/nodeinfo"
         || path.starts_with("/nodeinfo/")
@@ -81,15 +81,20 @@ fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
 
-    // ActivityPub gateway: route /ap/*, webfinger, and nodeinfo on the divine.video
-    // (or dvines.org) apex to the divine-activity-pub worker. Everything else is
-    // untouched. NOTE: leaves /.well-known/nostr.json and /.well-known/atproto-did
-    // on the main backend (only /.well-known/webfinger is diverted).
+    // ActivityPub on the divine.video / dvines.org apex:
+    //  - /.well-known/webfinger -> served HERE from the username KV (proper 404s).
+    //  - /ap/* and /nodeinfo     -> diverted to the divine-activity-pub worker.
+    // Everything else (incl. /.well-known/nostr.json + /.well-known/atproto-did) untouched.
     let hostname_only = host.split(':').next().unwrap_or(&host);
     let is_apex_divine = hostname_only.eq_ignore_ascii_case("divine.video")
         || hostname_only.eq_ignore_ascii_case("dvines.org");
-    if is_apex_divine && is_activitypub_path(&path) {
-        return passthrough(req, ACTIVITYPUB_BACKEND, &host);
+    if is_apex_divine {
+        if path == "/.well-known/webfinger" {
+            return handle_webfinger(&req);
+        }
+        if is_activitypub_path(&path) {
+            return passthrough(req, ACTIVITYPUB_BACKEND, &host);
+        }
     }
 
     // Parse hostname to determine routing
@@ -335,6 +340,50 @@ fn handle_username_request(username: &str, path: &str, req: Request) -> Result<R
                     username
                 )))
         }
+    }
+}
+
+// WebFinger (RFC 7033) for @user@divine.video, served from the username KV.
+// Returns a JRD whose rel:self points at the AP gateway actor; 404 for unknown
+// or non-active users. No origin subrequest — reads the same KV as NIP-05.
+fn handle_webfinger(req: &Request) -> Result<Response, Error> {
+    let resource = req
+        .get_url()
+        .query_pairs()
+        .find(|(k, _)| k == "resource")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let acct = resource.strip_prefix("acct:").unwrap_or(&resource);
+    let mut parts = acct.splitn(2, '@');
+    let user = parts.next().unwrap_or("").to_lowercase();
+    let host = parts.next().unwrap_or("divine.video");
+    if user.is_empty() {
+        return Ok(Response::from_status(StatusCode::BAD_REQUEST)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_body("{\"error\":\"missing or malformed resource\"}"));
+    }
+
+    match lookup_username(&user) {
+        Some(data) if data.status == "active" => {
+            let actor = format!("https://divine.video/ap/users/{}", user);
+            let profile = format!("https://{}.divine.video", user);
+            let jrd = serde_json::json!({
+                "subject": format!("acct:{}@{}", user, host),
+                "aliases": [profile, actor],
+                "links": [
+                    {"rel": "http://webfinger.net/rel/profile-page", "type": "text/html", "href": profile},
+                    {"rel": "self", "type": "application/activity+json", "href": actor}
+                ]
+            });
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/jrd+json")
+                .with_header("Access-Control-Allow-Origin", "*")
+                .with_body(serde_json::to_string(&jrd).unwrap_or_default()))
+        }
+        _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_header("Access-Control-Allow-Origin", "*")
+            .with_body("{\"error\":\"not found\"}")),
     }
 }
 
