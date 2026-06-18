@@ -301,6 +301,8 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
     req.set_header(header::HOST, headers.backend_host);
     req.set_header("X-Forwarded-Host", headers.forwarded_host);
     req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
+    // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
+    req.set_stale_if_error(0);
     Ok(req.send(backend)?)
 }
 
