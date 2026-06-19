@@ -1,0 +1,26 @@
+name: Rust
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --target wasm32-wasip1
+
+      - name: Build
+        run: cargo +1.88.0 build --locked --profile release --target wasm32-wasip1
+
+      - name: Test
+        run: cargo +1.88.0 test --locked
