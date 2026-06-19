@@ -4,7 +4,6 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Fastly Compute artifacts
 /bin/
