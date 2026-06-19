@@ -30,6 +30,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.sound_proxy]
       url = "https://divine-sound-proxy.edgecompute.app"
 
+    [local_server.backends.activitypub_gateway]
+      url = "https://divine-activity-pub.protestnet.workers.dev"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.usernames]
@@ -65,6 +68,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.sound_proxy]
       address = "divine-sound-proxy.edgecompute.app"
+      port = 443
+
+    [setup.backends.activitypub_gateway]
+      address = "divine-activity-pub.protestnet.workers.dev"
       port = 443
 
   [setup.kv_stores]

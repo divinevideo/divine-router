@@ -13,7 +13,19 @@ const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const SOUND_PROXY_BACKEND: &str = "sound_proxy";
+const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+
+// ActivityPub gateway paths served on the divine.video apex by the
+// divine-activity-pub worker (actors, outbox, inbox, nodeinfo). NOTE: WebFinger
+// is NOT here — the router serves it directly from the username KV (handle_webfinger).
+fn is_activitypub_path(path: &str) -> bool {
+    path == "/ap"
+        || path.starts_with("/ap/")
+        || path == "/.well-known/nodeinfo"
+        || path == "/nodeinfo"
+        || path.starts_with("/nodeinfo/")
+}
 
 // Subdomains that route to blossom/media server
 const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
@@ -70,6 +82,22 @@ fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
 
+    // ActivityPub on the divine.video / dvines.org apex:
+    //  - /.well-known/webfinger -> served HERE from the username KV (proper 404s).
+    //  - /ap/* and /nodeinfo     -> diverted to the divine-activity-pub worker.
+    // Everything else (incl. /.well-known/nostr.json + /.well-known/atproto-did) untouched.
+    let hostname_only = host.split(':').next().unwrap_or(&host);
+    let is_apex_divine = hostname_only.eq_ignore_ascii_case("divine.video")
+        || hostname_only.eq_ignore_ascii_case("dvines.org");
+    if is_apex_divine {
+        if path == "/.well-known/webfinger" {
+            return handle_webfinger(&req);
+        }
+        if is_activitypub_path(&path) {
+            return passthrough(req, ACTIVITYPUB_BACKEND, &host);
+        }
+    }
+
     // Parse hostname to determine routing
     match classify_host(&host) {
         HostType::Apex => {
@@ -89,7 +117,7 @@ fn main(req: Request) -> Result<Response, Error> {
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
             } else if subdomain == "api" {
-                passthrough(req, backend_for_system_request(&subdomain, &path), &host)
+                passthrough(req, api_backend_for_path(&path), &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -152,6 +180,7 @@ const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
 const SOUND_PROXY_BACKEND_HOST: &str = "divine-sound-proxy.edgecompute.app";
+const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughHeaders<'a> {
@@ -167,17 +196,20 @@ fn backend_host_for(backend: &str) -> &'static str {
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
         SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
+        ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
 }
 
-fn backend_for_system_request(subdomain: &str, path: &str) -> &'static str {
-    if subdomain == "api" && path.starts_with("/api/sounds/") {
+fn is_api_sound_path(path: &str) -> bool {
+    path == "/api/sounds" || path.starts_with("/api/sounds/")
+}
+
+fn api_backend_for_path(path: &str) -> &'static str {
+    if is_api_sound_path(path) {
         SOUND_PROXY_BACKEND
-    } else if subdomain == "api" {
-        FUNNELCAKE_API_BACKEND
     } else {
-        MAIN_BACKEND
+        FUNNELCAKE_API_BACKEND
     }
 }
 
@@ -208,7 +240,8 @@ fn is_public_divine_host(host: &str) -> bool {
 }
 
 fn should_bypass_cache(host: &str, path: &str) -> bool {
-    path.starts_with("/.well-known/") && is_public_divine_host(host)
+    is_public_divine_host(host)
+        && (path.starts_with("/.well-known/") || is_activitypub_path(path))
 }
 
 fn api_cache_policy(
@@ -322,6 +355,50 @@ fn handle_username_request(username: &str, path: &str, req: Request) -> Result<R
                     username
                 )))
         }
+    }
+}
+
+// WebFinger (RFC 7033) for @user@divine.video, served from the username KV.
+// Returns a JRD whose rel:self points at the AP gateway actor; 404 for unknown
+// or non-active users. No origin subrequest — reads the same KV as NIP-05.
+fn handle_webfinger(req: &Request) -> Result<Response, Error> {
+    let resource = req
+        .get_url()
+        .query_pairs()
+        .find(|(k, _)| k == "resource")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let acct = resource.strip_prefix("acct:").unwrap_or(&resource);
+    let mut parts = acct.splitn(2, '@');
+    let user = parts.next().unwrap_or("").to_lowercase();
+    let host = parts.next().unwrap_or("divine.video");
+    if user.is_empty() {
+        return Ok(Response::from_status(StatusCode::BAD_REQUEST)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_body("{\"error\":\"missing or malformed resource\"}"));
+    }
+
+    match lookup_username(&user) {
+        Some(data) if data.status == "active" => {
+            let actor = format!("https://divine.video/ap/users/{}", user);
+            let profile = format!("https://{}.divine.video", user);
+            let jrd = serde_json::json!({
+                "subject": format!("acct:{}@{}", user, host),
+                "aliases": [profile, actor],
+                "links": [
+                    {"rel": "http://webfinger.net/rel/profile-page", "type": "text/html", "href": profile},
+                    {"rel": "self", "type": "application/activity+json", "href": actor}
+                ]
+            });
+            Ok(Response::from_status(StatusCode::OK)
+                .with_header(header::CONTENT_TYPE, "application/jrd+json")
+                .with_header("Access-Control-Allow-Origin", "*")
+                .with_body(serde_json::to_string(&jrd).unwrap_or_default()))
+        }
+        _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
+            .with_header(header::CONTENT_TYPE, "application/json")
+            .with_header("Access-Control-Allow-Origin", "*")
+            .with_body("{\"error\":\"not found\"}")),
     }
 }
 
@@ -823,6 +900,7 @@ mod tests {
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
             SOUND_PROXY_BACKEND,
+            ACTIVITYPUB_BACKEND,
         ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
@@ -896,26 +974,19 @@ mod tests {
 
     #[test]
     fn test_api_sound_paths_route_to_sound_proxy_backend() {
+        assert_eq!(api_backend_for_path("/api/sounds"), SOUND_PROXY_BACKEND);
+        assert_eq!(api_backend_for_path("/api/sounds/search"), SOUND_PROXY_BACKEND);
         assert_eq!(
-            backend_for_system_request("api", "/api/sounds/search"),
-            SOUND_PROXY_BACKEND
-        );
-        assert_eq!(
-            backend_for_system_request("api", "/api/sounds/providers"),
+            api_backend_for_path("/api/sounds/providers"),
             SOUND_PROXY_BACKEND
         );
     }
 
     #[test]
     fn test_api_non_sound_paths_still_route_to_funnelcake_backend() {
-        assert_eq!(
-            backend_for_system_request("api", "/api/search"),
-            FUNNELCAKE_API_BACKEND
-        );
-        assert_eq!(
-            backend_for_system_request("api", "/api/events"),
-            FUNNELCAKE_API_BACKEND
-        );
+        assert_eq!(api_backend_for_path("/api/search"), FUNNELCAKE_API_BACKEND);
+        assert_eq!(api_backend_for_path("/api/events"), FUNNELCAKE_API_BACKEND);
+        assert_eq!(api_backend_for_path("/api/sounds-v2"), FUNNELCAKE_API_BACKEND);
     }
 
     #[test]
