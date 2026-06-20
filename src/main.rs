@@ -225,9 +225,7 @@ struct ApiCachePolicy {
 fn is_public_divine_host(host: &str) -> bool {
     let hostname = host.split(':').next().unwrap_or(host);
 
-    hostname.eq_ignore_ascii_case("divine.video")
-        || hostname.eq_ignore_ascii_case("dvines.org")
-        || matches!(classify_host(host), HostType::System(_))
+    is_owned_apex_domain(hostname) || matches!(classify_host(host), HostType::System(_))
 }
 
 fn should_bypass_cache(host: &str, path: &str) -> bool {
@@ -402,6 +400,10 @@ fn parse_webfinger_resource(resource: &str) -> WebFingerLookup {
         return WebFingerLookup::BadRequest;
     }
 
+    // Any owned apex is accepted here regardless of which apex served the
+    // request (e.g. acct:x@dvines.org is honored on the divine.video host and
+    // vice versa). This is deliberate: the subject is canonicalized to
+    // divine.video and the user is still verified against KV.
     if let Some(host) = parts.next() {
         if !is_owned_apex_domain(host) {
             return WebFingerLookup::NotFound;
