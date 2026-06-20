@@ -14,6 +14,8 @@ const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
+const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 
 // ActivityPub gateway paths served on the divine.video apex by the
 // divine-activity-pub worker (actors, outbox, inbox, nodeinfo). NOTE: WebFinger
@@ -86,9 +88,7 @@ fn main(req: Request) -> Result<Response, Error> {
     //  - /ap/* and /nodeinfo     -> diverted to the divine-activity-pub worker.
     // Everything else (incl. /.well-known/nostr.json + /.well-known/atproto-did) untouched.
     let hostname_only = host.split(':').next().unwrap_or(&host);
-    let is_apex_divine = hostname_only.eq_ignore_ascii_case("divine.video")
-        || hostname_only.eq_ignore_ascii_case("dvines.org");
-    if is_apex_divine {
+    if is_owned_apex_domain(hostname_only) {
         if path == "/.well-known/webfinger" {
             return handle_webfinger(&req);
         }
@@ -171,6 +171,12 @@ fn classify_host(host: &str) -> HostType {
         // x.y.dvines.org or deeper (multi-level)
         _ => HostType::MultiLevel,
     }
+}
+
+fn is_owned_apex_domain(hostname: &str) -> bool {
+    OWNED_APEX_DOMAINS
+        .iter()
+        .any(|domain| hostname.eq_ignore_ascii_case(domain))
 }
 
 // Backend host headers - must match what the backend expects
@@ -355,38 +361,77 @@ fn handle_webfinger(req: &Request) -> Result<Response, Error> {
         .find(|(k, _)| k == "resource")
         .map(|(_, v)| v.to_string())
         .unwrap_or_default();
-    let acct = resource.strip_prefix("acct:").unwrap_or(&resource);
-    let mut parts = acct.splitn(2, '@');
-    let user = parts.next().unwrap_or("").to_lowercase();
-    let host = parts.next().unwrap_or("divine.video");
-    if user.is_empty() {
-        return Ok(Response::from_status(StatusCode::BAD_REQUEST)
-            .with_header(header::CONTENT_TYPE, "application/json")
-            .with_body("{\"error\":\"missing or malformed resource\"}"));
-    }
+
+    let user = match parse_webfinger_resource(&resource) {
+        WebFingerLookup::Lookup(user) => user,
+        WebFingerLookup::BadRequest => {
+            return Ok(Response::from_status(StatusCode::BAD_REQUEST)
+                .with_header(header::CONTENT_TYPE, "application/json")
+                .with_body("{\"error\":\"missing or malformed resource\"}"));
+        }
+        WebFingerLookup::NotFound => {
+            return Ok(webfinger_not_found_response());
+        }
+    };
 
     match lookup_username(&user) {
         Some(data) if data.status == "active" => {
-            let actor = format!("https://divine.video/ap/users/{}", user);
-            let profile = format!("https://{}.divine.video", user);
-            let jrd = serde_json::json!({
-                "subject": format!("acct:{}@{}", user, host),
-                "aliases": [profile, actor],
-                "links": [
-                    {"rel": "http://webfinger.net/rel/profile-page", "type": "text/html", "href": profile},
-                    {"rel": "self", "type": "application/activity+json", "href": actor}
-                ]
-            });
+            let jrd = build_webfinger_jrd(&user);
             Ok(Response::from_status(StatusCode::OK)
                 .with_header(header::CONTENT_TYPE, "application/jrd+json")
                 .with_header("Access-Control-Allow-Origin", "*")
                 .with_body(serde_json::to_string(&jrd).unwrap_or_default()))
         }
-        _ => Ok(Response::from_status(StatusCode::NOT_FOUND)
-            .with_header(header::CONTENT_TYPE, "application/json")
-            .with_header("Access-Control-Allow-Origin", "*")
-            .with_body("{\"error\":\"not found\"}")),
+        _ => Ok(webfinger_not_found_response()),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WebFingerLookup {
+    Lookup(String),
+    BadRequest,
+    NotFound,
+}
+
+fn parse_webfinger_resource(resource: &str) -> WebFingerLookup {
+    let acct = resource.strip_prefix("acct:").unwrap_or(resource);
+    let mut parts = acct.splitn(2, '@');
+    let user = parts.next().unwrap_or("").to_lowercase();
+
+    if user.is_empty() {
+        return WebFingerLookup::BadRequest;
+    }
+
+    if let Some(host) = parts.next() {
+        if !is_owned_apex_domain(host) {
+            return WebFingerLookup::NotFound;
+        }
+    }
+
+    WebFingerLookup::Lookup(user)
+}
+
+fn build_webfinger_jrd(user: &str) -> serde_json::Value {
+    let actor = format!("https://{}/ap/users/{}", CANONICAL_WEBFINGER_DOMAIN, user);
+    let profile = format!("https://{}.{}", user, CANONICAL_WEBFINGER_DOMAIN);
+
+    // dvines.org is an owned apex, but ActivityPub actor/profile URLs are
+    // canonical on divine.video. Keep the WebFinger subject aligned with them.
+    serde_json::json!({
+        "subject": format!("acct:{}@{}", user, CANONICAL_WEBFINGER_DOMAIN),
+        "aliases": [profile, actor],
+        "links": [
+            {"rel": "http://webfinger.net/rel/profile-page", "type": "text/html", "href": profile},
+            {"rel": "self", "type": "application/activity+json", "href": actor}
+        ]
+    })
+}
+
+fn webfinger_not_found_response() -> Response {
+    Response::from_status(StatusCode::NOT_FOUND)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_header("Access-Control-Allow-Origin", "*")
+        .with_body("{\"error\":\"not found\"}")
 }
 
 fn handle_nip05(username: &str, req: &Request) -> Result<Response, Error> {
@@ -680,6 +725,72 @@ mod tests {
             Some(&"abc123pubkey".to_string())
         );
         assert!(!response.names.contains_key("DANIEL"));
+    }
+
+    #[test]
+    fn test_parse_webfinger_resource_accepts_owned_domains() {
+        assert_eq!(
+            parse_webfinger_resource("acct:alice@divine.video"),
+            WebFingerLookup::Lookup("alice".to_string())
+        );
+        assert_eq!(
+            parse_webfinger_resource("acct:alice@dvines.org"),
+            WebFingerLookup::Lookup("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_webfinger_resource_accepts_bare_username() {
+        assert_eq!(
+            parse_webfinger_resource("alice"),
+            WebFingerLookup::Lookup("alice".to_string())
+        );
+        assert_eq!(
+            parse_webfinger_resource("acct:alice"),
+            WebFingerLookup::Lookup("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_webfinger_resource_rejects_foreign_domains() {
+        assert_eq!(
+            parse_webfinger_resource("acct:alice@evil.com"),
+            WebFingerLookup::NotFound
+        );
+        assert_eq!(
+            parse_webfinger_resource("acct:alice@divine.video.evil.com"),
+            WebFingerLookup::NotFound
+        );
+    }
+
+    #[test]
+    fn test_parse_webfinger_resource_accepts_mixed_case_owned_domain() {
+        assert_eq!(
+            parse_webfinger_resource("acct:ALICE@DIVINE.VIDEO"),
+            WebFingerLookup::Lookup("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_webfinger_resource_rejects_missing_user() {
+        assert_eq!(parse_webfinger_resource(""), WebFingerLookup::BadRequest);
+        assert_eq!(
+            parse_webfinger_resource("acct:@divine.video"),
+            WebFingerLookup::BadRequest
+        );
+    }
+
+    #[test]
+    fn test_build_webfinger_jrd_uses_canonical_subject() {
+        let jrd = build_webfinger_jrd("alice");
+
+        assert_eq!(jrd["subject"], "acct:alice@divine.video");
+        assert_eq!(jrd["aliases"][0], "https://alice.divine.video");
+        assert_eq!(jrd["aliases"][1], "https://divine.video/ap/users/alice");
+        assert_eq!(
+            jrd["links"][1]["href"],
+            "https://divine.video/ap/users/alice"
+        );
     }
 
     #[test]
