@@ -1,7 +1,7 @@
 // ABOUTME: Divine Router - Fastly edge router for wildcard subdomains
 // ABOUTME: Routes username.divine.video to profiles, passes through system subdomains
 
-use fastly::http::{header, StatusCode};
+use fastly::http::{StatusCode, header};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -145,8 +145,7 @@ fn classify_host(host: &str) -> HostType {
     let is_our_domain = parts.len() >= 2 && {
         let tld = parts[parts.len() - 1];
         let sld = parts[parts.len() - 2];
-        (sld == "dvines" && tld == "org")
-            || (sld == "divine" && tld == "video")
+        (sld == "dvines" && tld == "org") || (sld == "divine" && tld == "video")
     };
 
     if !is_our_domain {
@@ -222,6 +221,12 @@ struct ApiCachePolicy {
     fallback_ttl_secs: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassthroughCacheMode {
+    Pass,
+    Cacheable { fallback_ttl_secs: Option<u32> },
+}
+
 fn is_public_divine_host(host: &str) -> bool {
     let hostname = host.split(':').next().unwrap_or(host);
 
@@ -229,8 +234,7 @@ fn is_public_divine_host(host: &str) -> bool {
 }
 
 fn should_bypass_cache(host: &str, path: &str) -> bool {
-    is_public_divine_host(host)
-        && (path.starts_with("/.well-known/") || is_activitypub_path(path))
+    is_public_divine_host(host) && (path.starts_with("/.well-known/") || is_activitypub_path(path))
 }
 
 fn api_cache_policy(
@@ -262,6 +266,34 @@ fn api_cache_policy(
     }
 }
 
+fn passthrough_cache_mode(
+    host: &str,
+    method: &str,
+    path: &str,
+    has_authorization: bool,
+    is_websocket_upgrade: bool,
+) -> PassthroughCacheMode {
+    if should_bypass_cache(host, path) || is_websocket_upgrade {
+        return PassthroughCacheMode::Pass;
+    }
+
+    if path.starts_with("/api/") {
+        let policy = api_cache_policy(host, method, path, has_authorization, is_websocket_upgrade);
+
+        if !policy.cacheable {
+            return PassthroughCacheMode::Pass;
+        }
+
+        return PassthroughCacheMode::Cacheable {
+            fallback_ttl_secs: policy.fallback_ttl_secs,
+        };
+    }
+
+    PassthroughCacheMode::Cacheable {
+        fallback_ttl_secs: None,
+    }
+}
+
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
     let mut req = req;
     let path = req.get_path().to_string();
@@ -275,7 +307,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         .get_header_str(header::UPGRADE)
         .map(|value| value.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let policy = api_cache_policy(
+    let cache_mode = passthrough_cache_mode(
         original_host,
         req.get_method_str(),
         &path,
@@ -283,13 +315,12 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         is_websocket_upgrade,
     );
 
-    if should_bypass_cache(original_host, &path) {
-        req.set_pass(true);
-    } else if is_websocket_upgrade {
-        req.set_pass(true);
-    } else if path.starts_with("/api/") {
-        if policy.cacheable {
-            if let Some(ttl_secs) = policy.fallback_ttl_secs {
+    match cache_mode {
+        PassthroughCacheMode::Pass => req.set_pass(true),
+        PassthroughCacheMode::Cacheable { fallback_ttl_secs } => {
+            // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
+            req.set_stale_if_error(0);
+            if let Some(ttl_secs) = fallback_ttl_secs {
                 req.set_after_send(move |candidate| {
                     if !candidate.contains_header("surrogate-control") {
                         candidate.set_ttl(Duration::from_secs(ttl_secs as u64));
@@ -297,16 +328,12 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
                     Ok(())
                 });
             }
-        } else {
-            req.set_pass(true);
         }
     }
 
     req.set_header(header::HOST, headers.backend_host);
     req.set_header("X-Forwarded-Host", headers.forwarded_host);
     req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
-    // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
-    req.set_stale_if_error(0);
     Ok(req.send(backend)?)
 }
 
@@ -1068,6 +1095,74 @@ mod tests {
 
         assert!(policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_public_well_known_paths() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "divine.video",
+                "GET",
+                "/.well-known/webfinger",
+                false,
+                false
+            ),
+            PassthroughCacheMode::Pass
+        );
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/.well-known/assetlinks.json",
+                false,
+                false
+            ),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_websocket_upgrades() {
+        assert_eq!(
+            passthrough_cache_mode("relay.divine.video", "GET", "/api/search", false, true),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_non_cacheable_api_requests() {
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "GET", "/api/search", true, false),
+            PassthroughCacheMode::Pass
+        );
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "POST", "/api/events", false, false),
+            PassthroughCacheMode::Pass
+        );
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "GET", "/api/docs", false, false),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_caches_public_api_gets() {
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "GET", "/api/search", false, false),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: Some(30)
+            }
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_uses_default_cache_for_regular_passthrough() {
+        assert_eq!(
+            passthrough_cache_mode("www.divine.video", "GET", "/", false, false),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None
+            }
+        );
     }
 
     #[test]
