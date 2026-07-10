@@ -1,6 +1,6 @@
 # Divine Router
 
-Fastly Compute@Edge router for wildcard subdomain routing on Divine Video.
+Fastly Compute@Edge router for wildcard subdomain routing on Divine.
 
 This is the public edge, not the ArgoCD-managed GKE stack. Production ATProto rollout depends on this service being published separately from `divine-iac-coreconfig`.
 
@@ -76,3 +76,7 @@ Reserved subdomains that passthrough to origin:
 ## License
 
 MIT
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
