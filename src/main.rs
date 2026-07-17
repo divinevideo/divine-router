@@ -1,6 +1,7 @@
 // ABOUTME: Divine Router - Fastly edge router for wildcard subdomains
 // ABOUTME: Routes username.divine.video to profiles, passes through system subdomains
 
+use fastly::http::request::SendErrorCause;
 use fastly::http::{StatusCode, header};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
@@ -230,6 +231,13 @@ enum PassthroughCacheMode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateCacheAction {
+    ServeStale,
+    SetFallbackTtl(Duration),
+    PreserveOrigin,
+}
+
 fn is_public_divine_host(host: &str) -> bool {
     let hostname = host.split(':').next().unwrap_or(host);
 
@@ -291,6 +299,26 @@ fn honors_origin_stale_if_error(
         && (policy.cacheable || is_rss_feed_path(path))
 }
 
+fn candidate_cache_action(
+    honors_origin_stale_if_error: bool,
+    is_server_error: bool,
+    stale_if_error_available: bool,
+    response_ttl: Duration,
+    fallback_ttl_secs: Option<u32>,
+) -> CandidateCacheAction {
+    if honors_origin_stale_if_error && is_server_error && stale_if_error_available {
+        return CandidateCacheAction::ServeStale;
+    }
+
+    if response_ttl.is_zero()
+        && let Some(ttl_secs) = fallback_ttl_secs
+    {
+        return CandidateCacheAction::SetFallbackTtl(Duration::from_secs(ttl_secs as u64));
+    }
+
+    CandidateCacheAction::PreserveOrigin
+}
+
 fn passthrough_cache_mode(
     host: &str,
     method: &str,
@@ -303,21 +331,26 @@ fn passthrough_cache_mode(
     }
 
     let policy = api_cache_policy(host, method, path, has_authorization, is_websocket_upgrade);
+    let honors_origin_stale_if_error = honors_origin_stale_if_error(
+        host,
+        method,
+        path,
+        has_authorization,
+        is_websocket_upgrade,
+        policy,
+    );
+    let is_api_rss_path = is_rss_feed_path(path)
+        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
 
-    if path.starts_with("/api/") && !policy.cacheable {
+    if (path.starts_with("/api/") && !policy.cacheable)
+        || (is_api_rss_path && !honors_origin_stale_if_error)
+    {
         return PassthroughCacheMode::Pass;
     }
 
     PassthroughCacheMode::Cacheable {
         fallback_ttl_secs: policy.fallback_ttl_secs,
-        honors_origin_stale_if_error: honors_origin_stale_if_error(
-            host,
-            method,
-            path,
-            has_authorization,
-            is_websocket_upgrade,
-            policy,
-        ),
+        honors_origin_stale_if_error,
     }
 }
 
@@ -353,14 +386,25 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
                 req.set_stale_if_error(0);
             }
 
-            if let Some(ttl_secs) = fallback_ttl_secs {
-                req.set_after_send(move |candidate| {
-                    if !candidate.contains_header("surrogate-control") {
-                        candidate.set_ttl(Duration::from_secs(ttl_secs as u64));
+            req.set_after_send(move |candidate| {
+                match candidate_cache_action(
+                    honors_origin_stale_if_error,
+                    candidate.get_status().is_server_error(),
+                    candidate.stale_if_error_available(),
+                    candidate.get_ttl(),
+                    fallback_ttl_secs,
+                ) {
+                    CandidateCacheAction::ServeStale => {
+                        // An after-send error discards the 5xx candidate and serves available stale.
+                        Err(SendErrorCause::DestinationUnavailable)
                     }
-                    Ok(())
-                });
-            }
+                    CandidateCacheAction::SetFallbackTtl(ttl) => {
+                        candidate.set_ttl(ttl);
+                        Ok(())
+                    }
+                    CandidateCacheAction::PreserveOrigin => Ok(()),
+                }
+            });
         }
     }
 
@@ -1179,6 +1223,14 @@ mod tests {
     }
 
     #[test]
+    fn test_passthrough_cache_mode_passes_authenticated_rss_requests() {
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "GET", "/feed/global.xml", true, false),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
     fn test_passthrough_cache_mode_caches_public_api_gets() {
         assert_eq!(
             passthrough_cache_mode("api.divine.video", "GET", "/api/search", false, false),
@@ -1309,6 +1361,42 @@ mod tests {
                 host, "GET", path, false, false, policy,
             ));
         }
+    }
+
+    #[test]
+    fn test_candidate_cache_action_serves_stale_for_eligible_server_errors() {
+        assert_eq!(
+            candidate_cache_action(true, true, true, Duration::ZERO, None),
+            CandidateCacheAction::ServeStale
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_server_errors_without_eligible_stale() {
+        assert_eq!(
+            candidate_cache_action(true, true, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+        assert_eq!(
+            candidate_cache_action(false, true, true, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_uses_fallback_only_for_zero_effective_ttl() {
+        assert_eq!(
+            candidate_cache_action(false, false, false, Duration::ZERO, Some(30)),
+            CandidateCacheAction::SetFallbackTtl(Duration::from_secs(30))
+        );
+        assert_eq!(
+            candidate_cache_action(false, false, false, Duration::from_secs(120), Some(30)),
+            CandidateCacheAction::PreserveOrigin
+        );
+        assert_eq!(
+            candidate_cache_action(false, false, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
     }
 
     #[test]
