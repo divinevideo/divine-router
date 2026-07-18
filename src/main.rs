@@ -325,6 +325,13 @@ fn candidate_cache_action(
     CandidateCacheAction::PreserveOrigin
 }
 
+fn should_register_cache_hook(
+    fallback_ttl_secs: Option<u32>,
+    honors_origin_stale_if_error: bool,
+) -> bool {
+    fallback_ttl_secs.is_some() || honors_origin_stale_if_error
+}
+
 fn passthrough_cache_mode(
     host: &str,
     method: &str,
@@ -387,31 +394,35 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
             fallback_ttl_secs,
             honors_origin_stale_if_error,
         } => {
+            // Eligible Funnelcake API and RSS responses define their bounded stale window in
+            // origin cache headers; leave it untouched so the origin remains the policy owner.
             if !honors_origin_stale_if_error {
                 // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
                 req.set_stale_if_error(0);
             }
 
-            req.set_after_send(move |candidate| {
-                match candidate_cache_action(
-                    honors_origin_stale_if_error,
-                    candidate.get_status().is_server_error(),
-                    candidate.stale_if_error_available(),
-                    candidate.contains_header("surrogate-control"),
-                    candidate.get_ttl(),
-                    fallback_ttl_secs,
-                ) {
-                    CandidateCacheAction::ServeStale => {
-                        // An after-send error discards the 5xx candidate and serves available stale.
-                        Err(SendErrorCause::DestinationUnavailable)
+            if should_register_cache_hook(fallback_ttl_secs, honors_origin_stale_if_error) {
+                req.set_after_send(move |candidate| {
+                    match candidate_cache_action(
+                        honors_origin_stale_if_error,
+                        candidate.get_status().is_server_error(),
+                        candidate.stale_if_error_available(),
+                        candidate.contains_header("surrogate-control"),
+                        candidate.get_ttl(),
+                        fallback_ttl_secs,
+                    ) {
+                        CandidateCacheAction::ServeStale => {
+                            // An after-send error discards the 5xx candidate and serves available stale.
+                            Err(SendErrorCause::DestinationUnavailable)
+                        }
+                        CandidateCacheAction::SetFallbackTtl(ttl) => {
+                            candidate.set_ttl(ttl);
+                            Ok(())
+                        }
+                        CandidateCacheAction::PreserveOrigin => Ok(()),
                     }
-                    CandidateCacheAction::SetFallbackTtl(ttl) => {
-                        candidate.set_ttl(ttl);
-                        Ok(())
-                    }
-                    CandidateCacheAction::PreserveOrigin => Ok(()),
-                }
-            });
+                });
+            }
         }
     }
 
@@ -1238,6 +1249,25 @@ mod tests {
     }
 
     #[test]
+    fn test_passthrough_cache_mode_passes_non_get_rss_requests() {
+        assert_eq!(
+            passthrough_cache_mode("api.divine.video", "POST", "/feed/global.xml", false, false),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_does_not_honor_rss_outside_api_host() {
+        assert_eq!(
+            passthrough_cache_mode("www.divine.video", "GET", "/feed/global.xml", false, false),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }
+        );
+    }
+
+    #[test]
     fn test_passthrough_cache_mode_caches_public_api_gets() {
         assert_eq!(
             passthrough_cache_mode("api.divine.video", "GET", "/api/search", false, false),
@@ -1268,6 +1298,13 @@ mod tests {
                 honors_origin_stale_if_error: false,
             }
         );
+    }
+
+    #[test]
+    fn test_after_send_hook_is_limited_to_api_fallback_and_serve_stale_paths() {
+        assert!(!should_register_cache_hook(None, false));
+        assert!(should_register_cache_hook(Some(30), false));
+        assert!(should_register_cache_hook(None, true));
     }
 
     #[test]
