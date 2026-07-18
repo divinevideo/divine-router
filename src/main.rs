@@ -303,14 +303,20 @@ fn candidate_cache_action(
     honors_origin_stale_if_error: bool,
     is_server_error: bool,
     stale_if_error_available: bool,
+    has_surrogate_control: bool,
     response_ttl: Duration,
     fallback_ttl_secs: Option<u32>,
 ) -> CandidateCacheAction {
-    if honors_origin_stale_if_error && is_server_error && stale_if_error_available {
-        return CandidateCacheAction::ServeStale;
+    if is_server_error {
+        return if honors_origin_stale_if_error && stale_if_error_available {
+            CandidateCacheAction::ServeStale
+        } else {
+            CandidateCacheAction::PreserveOrigin
+        };
     }
 
-    if response_ttl.is_zero()
+    if !has_surrogate_control
+        && response_ttl.is_zero()
         && let Some(ttl_secs) = fallback_ttl_secs
     {
         return CandidateCacheAction::SetFallbackTtl(Duration::from_secs(ttl_secs as u64));
@@ -391,6 +397,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
                     honors_origin_stale_if_error,
                     candidate.get_status().is_server_error(),
                     candidate.stale_if_error_available(),
+                    candidate.contains_header("surrogate-control"),
                     candidate.get_ttl(),
                     fallback_ttl_secs,
                 ) {
@@ -1366,7 +1373,7 @@ mod tests {
     #[test]
     fn test_candidate_cache_action_serves_stale_for_eligible_server_errors() {
         assert_eq!(
-            candidate_cache_action(true, true, true, Duration::ZERO, None),
+            candidate_cache_action(true, true, true, false, Duration::ZERO, None),
             CandidateCacheAction::ServeStale
         );
     }
@@ -1374,11 +1381,27 @@ mod tests {
     #[test]
     fn test_candidate_cache_action_preserves_server_errors_without_eligible_stale() {
         assert_eq!(
-            candidate_cache_action(true, true, false, Duration::ZERO, None),
+            candidate_cache_action(true, true, false, false, Duration::ZERO, None),
             CandidateCacheAction::PreserveOrigin
         );
         assert_eq!(
-            candidate_cache_action(false, true, true, Duration::ZERO, None),
+            candidate_cache_action(false, true, true, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_api_server_errors_without_stale() {
+        assert_eq!(
+            candidate_cache_action(true, true, false, false, Duration::ZERO, Some(30)),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_explicit_zero_surrogate_ttl() {
+        assert_eq!(
+            candidate_cache_action(true, false, false, true, Duration::ZERO, Some(30)),
             CandidateCacheAction::PreserveOrigin
         );
     }
@@ -1386,15 +1409,22 @@ mod tests {
     #[test]
     fn test_candidate_cache_action_uses_fallback_only_for_zero_effective_ttl() {
         assert_eq!(
-            candidate_cache_action(false, false, false, Duration::ZERO, Some(30)),
+            candidate_cache_action(false, false, false, false, Duration::ZERO, Some(30)),
             CandidateCacheAction::SetFallbackTtl(Duration::from_secs(30))
         );
         assert_eq!(
-            candidate_cache_action(false, false, false, Duration::from_secs(120), Some(30)),
+            candidate_cache_action(
+                false,
+                false,
+                false,
+                false,
+                Duration::from_secs(120),
+                Some(30),
+            ),
             CandidateCacheAction::PreserveOrigin
         );
         assert_eq!(
-            candidate_cache_action(false, false, false, Duration::ZERO, None),
+            candidate_cache_action(false, false, false, false, Duration::ZERO, None),
             CandidateCacheAction::PreserveOrigin
         );
     }
