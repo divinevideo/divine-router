@@ -18,6 +18,12 @@ const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 
+/// Pins eligible API and RSS stale reuse at the edge for 24 hours.
+///
+/// This matches Funnelcake's intended cache contract without depending on its
+/// deployment state or Fastly defaults. Coordinate changes with origin policy.
+const EDGE_STALE_IF_ERROR_SECS: u32 = 24 * 60 * 60;
+
 // ActivityPub gateway paths served on the divine.video apex by the
 // divine-activity-pub worker (actors, outbox, inbox, nodeinfo). NOTE: WebFinger
 // is NOT here — the router serves it directly from the username KV (handle_webfinger).
@@ -238,6 +244,20 @@ enum CandidateCacheAction {
     PreserveOrigin,
 }
 
+fn stale_if_error_override_secs(cache_mode: PassthroughCacheMode) -> Option<u32> {
+    match cache_mode {
+        PassthroughCacheMode::Pass => None,
+        PassthroughCacheMode::Cacheable {
+            honors_origin_stale_if_error,
+            ..
+        } => Some(if honors_origin_stale_if_error {
+            EDGE_STALE_IF_ERROR_SECS
+        } else {
+            0
+        }),
+    }
+}
+
 fn is_public_divine_host(host: &str) -> bool {
     let hostname = host.split(':').next().unwrap_or(host);
 
@@ -388,19 +408,18 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         is_websocket_upgrade,
     );
 
+    // Pin eligible API/RSS stale reuse at the edge. Ordinary cacheable routes retain the
+    // zero-second opt-out, while pass routes receive no override that could reverse pass mode.
+    if let Some(stale_if_error_secs) = stale_if_error_override_secs(cache_mode) {
+        req.set_stale_if_error(stale_if_error_secs);
+    }
+
     match cache_mode {
         PassthroughCacheMode::Pass => req.set_pass(true),
         PassthroughCacheMode::Cacheable {
             fallback_ttl_secs,
             honors_origin_stale_if_error,
         } => {
-            // Eligible Funnelcake API and RSS responses define their bounded stale window in
-            // origin cache headers; leave it untouched so the origin remains the policy owner.
-            if !honors_origin_stale_if_error {
-                // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
-                req.set_stale_if_error(0);
-            }
-
             if should_register_cache_hook(fallback_ttl_secs, honors_origin_stale_if_error) {
                 req.set_after_send(move |candidate| {
                     match candidate_cache_action(
@@ -1305,6 +1324,28 @@ mod tests {
         assert!(!should_register_cache_hook(None, false));
         assert!(should_register_cache_hook(Some(30), false));
         assert!(should_register_cache_hook(None, true));
+    }
+
+    #[test]
+    fn test_stale_if_error_override_pins_eligible_edge_window() {
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: true,
+            }),
+            Some(86_400)
+        );
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Pass),
+            None
+        );
     }
 
     #[test]
