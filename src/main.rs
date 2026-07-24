@@ -13,6 +13,7 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const SOUND_PROXY_BACKEND: &str = "sound_proxy";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
@@ -123,7 +124,7 @@ fn main(req: Request) -> Result<Response, Error> {
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
             } else if subdomain == "api" {
-                passthrough(req, FUNNELCAKE_API_BACKEND, &host)
+                passthrough(req, api_backend_for_path(&path), &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -190,6 +191,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const SOUND_PROXY_BACKEND_HOST: &str = "divine-sound-proxy.edgecompute.app";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,8 +207,21 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
+    }
+}
+
+fn is_api_sound_path(path: &str) -> bool {
+    path == "/api/sounds" || path.starts_with("/api/sounds/")
+}
+
+fn api_backend_for_path(path: &str) -> &'static str {
+    if is_api_sound_path(path) {
+        SOUND_PROXY_BACKEND
+    } else {
+        FUNNELCAKE_API_BACKEND
     }
 }
 
@@ -1140,6 +1155,8 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            SOUND_PROXY_BACKEND,
+            ACTIVITYPUB_BACKEND,
         ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
@@ -1209,6 +1226,29 @@ mod tests {
 
         assert!(policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_api_sound_paths_route_to_sound_proxy_backend() {
+        assert_eq!(api_backend_for_path("/api/sounds"), SOUND_PROXY_BACKEND);
+        assert_eq!(
+            api_backend_for_path("/api/sounds/search"),
+            SOUND_PROXY_BACKEND
+        );
+        assert_eq!(
+            api_backend_for_path("/api/sounds/providers"),
+            SOUND_PROXY_BACKEND
+        );
+    }
+
+    #[test]
+    fn test_api_non_sound_paths_still_route_to_funnelcake_backend() {
+        assert_eq!(api_backend_for_path("/api/search"), FUNNELCAKE_API_BACKEND);
+        assert_eq!(api_backend_for_path("/api/events"), FUNNELCAKE_API_BACKEND);
+        assert_eq!(
+            api_backend_for_path("/api/sounds-v2"),
+            FUNNELCAKE_API_BACKEND
+        );
     }
 
     #[test]
