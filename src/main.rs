@@ -195,6 +195,7 @@ const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.d
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughHeaders<'a> {
     backend_host: &'static str,
+    original_host: &'a str,
     forwarded_host: &'a str,
     forwarded_proto: &'a str,
 }
@@ -217,6 +218,7 @@ fn passthrough_headers<'a>(
 ) -> PassthroughHeaders<'a> {
     PassthroughHeaders {
         backend_host: backend_host_for(backend),
+        original_host,
         forwarded_host: original_host,
         forwarded_proto: original_proto,
     }
@@ -446,6 +448,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
     }
 
     req.set_header(header::HOST, headers.backend_host);
+    req.set_header("X-Original-Host", headers.original_host);
     req.set_header("X-Forwarded-Host", headers.forwarded_host);
     req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
     Ok(req.send(backend)?)
@@ -1512,6 +1515,7 @@ mod tests {
         let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
 
         assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.original_host, "api.divine.video");
         assert_eq!(headers.forwarded_host, "api.divine.video");
         assert_eq!(headers.forwarded_proto, "https");
     }
