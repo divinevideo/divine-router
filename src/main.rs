@@ -184,7 +184,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
-const SOUND_PROXY_BACKEND_HOST: &str = "divine-sound-proxy.edgecompute.app";
+const SOUND_PROXY_BACKEND_HOST: &str = "sounds.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,12 +206,30 @@ fn backend_host_for(backend: &str) -> &'static str {
     }
 }
 
-fn is_api_sound_path(path: &str) -> bool {
-    path == "/api/sounds" || path.starts_with("/api/sounds/")
+// Sound library endpoints implemented by divine-sound-proxy under the
+// /api/sounds namespace. The rest of the namespace stays on Funnelcake —
+// notably /api/sounds itself, which is a live Funnelcake endpoint AND the
+// upstream the proxy's own /api/sounds/trending handler fetches.
+const SOUND_PROXY_API_PATHS: &[&str] = &[
+    "/api/sounds/providers",
+    "/api/sounds/search",
+    "/api/sounds/trending",
+];
+
+/// Matches `/api/sounds/{sound_event_id}/videos` only, so sibling endpoints
+/// such as `/api/sounds/{id}/stats` keep routing to Funnelcake.
+fn is_sound_proxy_videos_path(path: &str) -> bool {
+    path.strip_prefix("/api/sounds/")
+        .and_then(|rest| rest.strip_suffix("/videos"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn is_sound_proxy_path(path: &str) -> bool {
+    SOUND_PROXY_API_PATHS.contains(&path) || is_sound_proxy_videos_path(path)
 }
 
 fn api_backend_for_path(path: &str) -> &'static str {
-    if is_api_sound_path(path) {
+    if is_sound_proxy_path(path) {
         SOUND_PROXY_BACKEND
     } else {
         FUNNELCAKE_API_BACKEND
@@ -1115,16 +1133,43 @@ mod tests {
     }
 
     #[test]
-    fn test_api_sound_paths_route_to_sound_proxy_backend() {
-        assert_eq!(api_backend_for_path("/api/sounds"), SOUND_PROXY_BACKEND);
-        assert_eq!(
-            api_backend_for_path("/api/sounds/search"),
-            SOUND_PROXY_BACKEND
-        );
-        assert_eq!(
-            api_backend_for_path("/api/sounds/providers"),
-            SOUND_PROXY_BACKEND
-        );
+    fn test_sound_proxy_endpoints_route_to_sound_proxy_backend() {
+        for path in [
+            "/api/sounds/providers",
+            "/api/sounds/search",
+            "/api/sounds/trending",
+            "/api/sounds/evt123/videos",
+        ] {
+            assert_eq!(
+                api_backend_for_path(path),
+                SOUND_PROXY_BACKEND,
+                "{path} should route to the sound proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unimplemented_sound_paths_stay_on_funnelcake_backend() {
+        // /api/sounds is a live Funnelcake endpoint and the upstream for the
+        // proxy's own trending handler; the proxy 404s it.
+        for path in [
+            "/api/sounds",
+            "/api/sounds/",
+            "/api/sounds/evt123",
+            "/api/sounds/evt123/stats",
+            "/api/sounds/evt123/videos/extra",
+            "/api/sounds//videos",
+            "/api/sounds/providers/",
+            "/api/sounds/providers/extra",
+            "/api/sounds/searching",
+            "/api/sounds/trending/weekly",
+        ] {
+            assert_eq!(
+                api_backend_for_path(path),
+                FUNNELCAKE_API_BACKEND,
+                "{path} is not implemented by the sound proxy"
+            );
+        }
     }
 
     #[test]
@@ -1135,6 +1180,11 @@ mod tests {
             api_backend_for_path("/api/sounds-v2"),
             FUNNELCAKE_API_BACKEND
         );
+    }
+
+    #[test]
+    fn test_sound_proxy_backend_host_matches_deployed_worker_route() {
+        assert_eq!(backend_host_for(SOUND_PROXY_BACKEND), "sounds.divine.video");
     }
 
     #[test]

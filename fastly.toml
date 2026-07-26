@@ -28,7 +28,7 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
       url = "https://relay.divine.video"
 
     [local_server.backends.sound_proxy]
-      url = "https://divine-sound-proxy.edgecompute.app"
+      url = "https://sounds.divine.video"
 
     [local_server.backends.activitypub_gateway]
       url = "https://divine-activity-pub.protestnet.workers.dev"
@@ -67,7 +67,7 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
       port = 443
 
     [setup.backends.sound_proxy]
-      address = "divine-sound-proxy.edgecompute.app"
+      address = "sounds.divine.video"
       port = 443
 
     [setup.backends.activitypub_gateway]
