@@ -92,8 +92,12 @@ on Fastly Compute. It reads the request `Host` and path, classifies the host, an
 then either builds a response in-process (WebFinger, NIP-05, ATProto DID, 404s) or
 rewrites headers and forwards to a backend.
 
-On passthrough it sets `Host` to the backend's expected hostname and adds
-`X-Forwarded-Host` and `X-Forwarded-Proto`. Caching is decided per request:
+On passthrough it sets `Host` to the backend's expected hostname and overwrites
+`X-Original-Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` with values derived
+at the edge. `X-Original-Host` preserves the public hostname across downstream
+proxy rewrites for exact-URL authentication such as NIP-98; overwriting it on
+every backend prevents a client-supplied value from reaching trusted consumers.
+Caching is decided per request:
 
 - `/.well-known/*` and ActivityPub paths on public Divine hosts, plus WebSocket
   upgrades, are passed uncached.
