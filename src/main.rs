@@ -195,6 +195,7 @@ const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.d
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughHeaders<'a> {
     backend_host: &'static str,
+    original_host: &'a str,
     forwarded_host: &'a str,
     forwarded_proto: &'a str,
 }
@@ -217,9 +218,30 @@ fn passthrough_headers<'a>(
 ) -> PassthroughHeaders<'a> {
     PassthroughHeaders {
         backend_host: backend_host_for(backend),
+        original_host,
         forwarded_host: original_host,
         forwarded_proto: original_proto,
     }
+}
+
+trait PassthroughHeaderTarget {
+    fn overwrite_header(&mut self, name: &'static str, value: &str);
+}
+
+impl PassthroughHeaderTarget for Request {
+    fn overwrite_header(&mut self, name: &'static str, value: &str) {
+        self.set_header(name, value);
+    }
+}
+
+fn apply_passthrough_headers(
+    req: &mut impl PassthroughHeaderTarget,
+    headers: PassthroughHeaders<'_>,
+) {
+    req.overwrite_header("host", headers.backend_host);
+    req.overwrite_header("x-original-host", headers.original_host);
+    req.overwrite_header("x-forwarded-host", headers.forwarded_host);
+    req.overwrite_header("x-forwarded-proto", headers.forwarded_proto);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,9 +467,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    req.set_header(header::HOST, headers.backend_host);
-    req.set_header("X-Forwarded-Host", headers.forwarded_host);
-    req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
+    apply_passthrough_headers(&mut req, headers);
     Ok(req.send(backend)?)
 }
 
@@ -767,6 +787,15 @@ fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl PassthroughHeaderTarget for http::Request<()> {
+        fn overwrite_header(&mut self, name: &'static str, value: &str) {
+            self.headers_mut().insert(
+                http::header::HeaderName::from_static(name),
+                http::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+    }
 
     fn make_active_user(pubkey: &str, relays: Vec<String>) -> UsernameData {
         UsernameData {
@@ -1512,8 +1541,47 @@ mod tests {
         let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
 
         assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.original_host, "api.divine.video");
         assert_eq!(headers.forwarded_host, "api.divine.video");
         assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_apply_passthrough_headers_overwrites_spoofed_original_host() {
+        let mut req = http::Request::builder()
+            .uri("https://api.divine.video/api/videos")
+            .header(header::HOST, "api.divine.video")
+            .header("X-Original-Host", "spoofed.example")
+            .header("X-Original-Host", "another-spoofed.example")
+            .body(())
+            .unwrap();
+        let incoming_host = req
+            .headers()
+            .get(header::HOST)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, &incoming_host, "https");
+
+        apply_passthrough_headers(&mut req, headers);
+
+        let original_hosts: Vec<_> = req
+            .headers()
+            .get_all("X-Original-Host")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(original_hosts, vec!["api.divine.video"]);
+        assert_eq!(
+            req.headers().get(header::HOST).unwrap(),
+            FUNNELCAKE_BACKEND_HOST
+        );
+        assert_eq!(
+            req.headers().get("X-Forwarded-Host").unwrap(),
+            "api.divine.video"
+        );
+        assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "https");
     }
 
     #[test]
