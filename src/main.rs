@@ -13,8 +13,10 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const MOBILE_API_BACKEND: &str = "mobile_api";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 
@@ -33,6 +35,31 @@ fn is_activitypub_path(path: &str) -> bool {
         || path == "/.well-known/nodeinfo"
         || path == "/nodeinfo"
         || path.starts_with("/nodeinfo/")
+}
+
+fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
+    let hostname = host.split(':').next().unwrap_or(host);
+    if !hostname.eq_ignore_ascii_case(CANONICAL_API_HOST) {
+        return FUNNELCAKE_API_BACKEND;
+    }
+
+    let is_parent_contact_path = path
+        .strip_prefix("/v1/minor-review-cases/")
+        .and_then(|remainder| remainder.strip_suffix("/parent-contact"))
+        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
+    let is_mobile_api_path = path == "/v1/account/moderation-status"
+        || is_parent_contact_path
+        || path == "/api/zendesk/pre-auth";
+    let is_supported_request = (method == "GET" && path == "/v1/account/moderation-status")
+        || (method == "POST" && is_parent_contact_path)
+        || (method == "POST" && path == "/api/zendesk/pre-auth")
+        || (method == "OPTIONS" && is_mobile_api_path);
+
+    if is_supported_request {
+        MOBILE_API_BACKEND
+    } else {
+        FUNNELCAKE_API_BACKEND
+    }
 }
 
 // Subdomains that route to blossom/media server
@@ -123,7 +150,8 @@ fn main(req: Request) -> Result<Response, Error> {
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
             } else if subdomain == "api" {
-                passthrough(req, FUNNELCAKE_API_BACKEND, &host)
+                let backend = api_backend_for(&host, req.get_method_str(), &path);
+                passthrough(req, backend, &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -190,6 +218,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const MOBILE_API_BACKEND_HOST: &str = "api-relay-prod.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +235,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
@@ -380,8 +410,15 @@ fn passthrough_cache_mode(
     path: &str,
     has_authorization: bool,
     is_websocket_upgrade: bool,
+    backend: &str,
 ) -> PassthroughCacheMode {
     if should_bypass_cache(host, path) || is_websocket_upgrade {
+        return PassthroughCacheMode::Pass;
+    }
+
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+    if backend == MOBILE_API_BACKEND {
         return PassthroughCacheMode::Pass;
     }
 
@@ -394,8 +431,7 @@ fn passthrough_cache_mode(
         is_websocket_upgrade,
         policy,
     );
-    let is_api_rss_path = is_rss_feed_path(path)
-        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+    let is_api_rss_path = is_rss_feed_path(path) && is_api_host;
 
     if (path.starts_with("/api/") && !policy.cacheable)
         || (is_api_rss_path && !honors_origin_stale_if_error)
@@ -428,6 +464,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         &path,
         has_authorization,
         is_websocket_upgrade,
+        backend,
     );
 
     // Pin eligible API/RSS stale reuse at the edge. Ordinary cacheable routes retain the
@@ -1169,6 +1206,7 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            MOBILE_API_BACKEND,
         ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
@@ -1180,6 +1218,62 @@ mod tests {
             assert!(
                 fastly_toml.contains(&setup_backend),
                 "missing setup backend definition for {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_routes_only_mobile_moderation_contract_to_worker() {
+        for (method, path) in [
+            ("GET", "/v1/account/moderation-status"),
+            ("POST", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/api/zendesk/pre-auth"),
+            ("OPTIONS", "/v1/account/moderation-status"),
+            ("OPTIONS", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("OPTIONS", "/api/zendesk/pre-auth"),
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, method, path),
+                MOBILE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_keeps_unrelated_and_wrong_method_requests_on_funnelcake() {
+        for (method, path) in [
+            ("POST", "/v1/account/moderation-status"),
+            ("GET", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/v1/minor-review-cases//parent-contact"),
+            ("POST", "/v1/minor-review-cases/case/extra/parent-contact"),
+            ("GET", "/api/zendesk/pre-auth"),
+            ("GET", "/api/search"),
+            ("POST", "/api/events"),
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, method, path),
+                FUNNELCAKE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_keeps_mobile_routes_on_funnelcake_for_other_hosts() {
+        for host in ["api.dvines.org", "api.example.com"] {
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                FUNNELCAKE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_accepts_canonical_host_variants() {
+        for host in ["API.divine.video", "api.divine.video:443"] {
+            assert_eq!(classify_host(host), HostType::System("api".to_string()));
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                MOBILE_API_BACKEND
             );
         }
     }
@@ -1248,7 +1342,8 @@ mod tests {
                 "GET",
                 "/.well-known/webfinger",
                 false,
-                false
+                false,
+                MAIN_BACKEND,
             ),
             PassthroughCacheMode::Pass
         );
@@ -1258,7 +1353,8 @@ mod tests {
                 "GET",
                 "/.well-known/assetlinks.json",
                 false,
-                false
+                false,
+                FUNNELCAKE_API_BACKEND,
             ),
             PassthroughCacheMode::Pass
         );
@@ -1267,7 +1363,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_passes_websocket_upgrades() {
         assert_eq!(
-            passthrough_cache_mode("relay.divine.video", "GET", "/api/search", false, true),
+            passthrough_cache_mode(
+                "relay.divine.video",
+                "GET",
+                "/api/search",
+                false,
+                true,
+                MAIN_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
     }
@@ -1275,23 +1378,96 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_passes_non_cacheable_api_requests() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/search", true, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/search",
+                true,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "POST", "/api/events", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "POST",
+                "/api/events",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/docs", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/docs",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_mobile_api_requests() {
+        for (method, path, has_authorization) in [
+            ("GET", "/v1/account/moderation-status", true),
+            ("GET", "/v1/account/moderation-status", false),
+            (
+                "POST",
+                "/v1/minor-review-cases/case-123/parent-contact",
+                true,
+            ),
+            ("POST", "/api/zendesk/pre-auth", true),
+            ("OPTIONS", "/v1/account/moderation-status", false),
+        ] {
+            assert_eq!(
+                passthrough_cache_mode(
+                    "api.divine.video",
+                    method,
+                    path,
+                    has_authorization,
+                    false,
+                    MOBILE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_does_not_pass_unrelated_v1_requests() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/v1/unrelated",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }
         );
     }
 
     #[test]
     fn test_passthrough_cache_mode_passes_authenticated_rss_requests() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/feed/global.xml", true, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                true,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
     }
@@ -1299,7 +1475,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_passes_non_get_rss_requests() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "POST", "/feed/global.xml", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "POST",
+                "/feed/global.xml",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
     }
@@ -1307,7 +1490,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_does_not_honor_rss_outside_api_host() {
         assert_eq!(
-            passthrough_cache_mode("www.divine.video", "GET", "/feed/global.xml", false, false),
+            passthrough_cache_mode(
+                "www.divine.video",
+                "GET",
+                "/feed/global.xml",
+                false,
+                false,
+                MAIN_BACKEND,
+            ),
             PassthroughCacheMode::Cacheable {
                 fallback_ttl_secs: None,
                 honors_origin_stale_if_error: false,
@@ -1318,7 +1508,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_caches_public_api_gets() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/search", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/search",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Cacheable {
                 fallback_ttl_secs: Some(30),
                 honors_origin_stale_if_error: true,
@@ -1329,7 +1526,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_honors_origin_stale_if_error_for_public_rss() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/feed/global.xml", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Cacheable {
                 fallback_ttl_secs: None,
                 honors_origin_stale_if_error: true,
@@ -1340,7 +1544,7 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_uses_default_cache_for_regular_passthrough() {
         assert_eq!(
-            passthrough_cache_mode("www.divine.video", "GET", "/", false, false),
+            passthrough_cache_mode("www.divine.video", "GET", "/", false, false, MAIN_BACKEND),
             PassthroughCacheMode::Cacheable {
                 fallback_ttl_secs: None,
                 honors_origin_stale_if_error: false,
@@ -1541,6 +1745,16 @@ mod tests {
         let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
 
         assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.original_host, "api.divine.video");
+        assert_eq!(headers.forwarded_host, "api.divine.video");
+        assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_passthrough_headers_preserve_original_api_host_for_mobile_backend() {
+        let headers = passthrough_headers(MOBILE_API_BACKEND, "api.divine.video", "https");
+
+        assert_eq!(headers.backend_host, MOBILE_API_BACKEND_HOST);
         assert_eq!(headers.original_host, "api.divine.video");
         assert_eq!(headers.forwarded_host, "api.divine.video");
         assert_eq!(headers.forwarded_proto, "https");

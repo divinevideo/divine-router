@@ -48,7 +48,7 @@ Reserved single-level subdomains are routed by name:
 | --- | --- |
 | `media`, `blossom` | Blossom / media server |
 | `invite` | Invite faucet service |
-| `api` | Funnelcake API (`relay.divine.video`) |
+| `api` | Funnelcake API; on `api.divine.video` only, the exact mobile API routes below use the mobile API backend |
 | `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `stream`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
 
 ### Username subdomains (`alice.divine.video`, `alice.dvines.org`)
@@ -143,7 +143,18 @@ Backends are declared in `fastly.toml` for both the local server and Fastly setu
 | `blossom` | Blossom media server |
 | `invite_service` | Invite faucet |
 | `funnelcake_api` | API origin (`relay.divine.video`) |
+| `mobile_api` | Mobile-facing moderation and support identity API |
 | `activitypub_gateway` | ActivityPub gateway worker |
+
+On `api.divine.video`, the router sends only these public client contracts to
+`mobile_api`; all other API traffic stays on Funnelcake:
+
+- `GET /v1/account/moderation-status`
+- `POST /v1/minor-review-cases/{caseId}/parent-contact`
+- `POST /api/zendesk/pre-auth`
+
+Their `OPTIONS` preflights follow the same route; wrong methods and every other
+path stay on Funnelcake.
 
 Username records are read from KV under the key `user:<username>` with this shape:
 
@@ -167,6 +178,13 @@ Deploy with the Fastly CLI:
 ```bash
 fastly compute publish --non-interactive && fastly purge --all
 ```
+
+`[setup.backends]` bootstraps new Fastly services but is not applied to this
+already-associated service. Before deploying a package that first references a
+new static backend, add that backend to the editable service version and verify
+its address, host override, certificate hostname, and SNI hostname all target
+the intended origin. Never activate code that names a backend absent from the
+same service version.
 
 Because username, WebFinger, and ATProto responses come from KV, publish this service
 after the handle and ATProto state have been written by `divine-name-server`.
