@@ -409,6 +409,12 @@ fn passthrough_cache_mode(
         return PassthroughCacheMode::Pass;
     }
 
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+    if is_api_host && api_backend_for(method, path) == MOBILE_API_BACKEND {
+        return PassthroughCacheMode::Pass;
+    }
+
     let policy = api_cache_policy(host, method, path, has_authorization, is_websocket_upgrade);
     let honors_origin_stale_if_error = honors_origin_stale_if_error(
         host,
@@ -418,8 +424,7 @@ fn passthrough_cache_mode(
         is_websocket_upgrade,
         policy,
     );
-    let is_api_rss_path = is_rss_feed_path(path)
-        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+    let is_api_rss_path = is_rss_feed_path(path) && is_api_host;
 
     if (path.starts_with("/api/") && !policy.cacheable)
         || (is_api_rss_path && !honors_origin_stale_if_error)
@@ -1340,6 +1345,26 @@ mod tests {
             passthrough_cache_mode("api.divine.video", "GET", "/api/docs", false, false),
             PassthroughCacheMode::Pass
         );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_mobile_api_requests() {
+        for (method, path, has_authorization) in [
+            ("GET", "/v1/account/moderation-status", true),
+            ("GET", "/v1/account/moderation-status", false),
+            (
+                "POST",
+                "/v1/minor-review-cases/case-123/parent-contact",
+                true,
+            ),
+            ("POST", "/api/zendesk/pre-auth", true),
+            ("OPTIONS", "/v1/account/moderation-status", false),
+        ] {
+            assert_eq!(
+                passthrough_cache_mode("api.divine.video", method, path, has_authorization, false),
+                PassthroughCacheMode::Pass
+            );
+        }
     }
 
     #[test]
