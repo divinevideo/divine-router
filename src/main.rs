@@ -16,6 +16,7 @@ const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const MOBILE_API_BACKEND: &str = "mobile_api";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 
@@ -38,7 +39,7 @@ fn is_activitypub_path(path: &str) -> bool {
 
 fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
     let hostname = host.split(':').next().unwrap_or(host);
-    if !hostname.eq_ignore_ascii_case("api.divine.video") {
+    if !hostname.eq_ignore_ascii_case(CANONICAL_API_HOST) {
         return FUNNELCAKE_API_BACKEND;
     }
 
@@ -1232,7 +1233,7 @@ mod tests {
             ("OPTIONS", "/api/zendesk/pre-auth"),
         ] {
             assert_eq!(
-                api_backend_for("api.divine.video", method, path),
+                api_backend_for(CANONICAL_API_HOST, method, path),
                 MOBILE_API_BACKEND
             );
         }
@@ -1250,7 +1251,7 @@ mod tests {
             ("POST", "/api/events"),
         ] {
             assert_eq!(
-                api_backend_for("api.divine.video", method, path),
+                api_backend_for(CANONICAL_API_HOST, method, path),
                 FUNNELCAKE_API_BACKEND
             );
         }
@@ -1262,6 +1263,16 @@ mod tests {
             assert_eq!(
                 api_backend_for(host, "GET", "/v1/account/moderation-status"),
                 FUNNELCAKE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_accepts_canonical_host_variants() {
+        for host in ["API.DIVINE.VIDEO", "api.divine.video:443"] {
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                MOBILE_API_BACKEND
             );
         }
     }
