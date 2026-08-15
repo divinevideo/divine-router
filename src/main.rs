@@ -1268,14 +1268,14 @@ mod tests {
     }
 
     #[test]
-    fn test_api_backend_accepts_canonical_host_with_port() {
-        let host = "api.divine.video:443";
-
-        assert_eq!(classify_host(host), HostType::System("api".to_string()));
-        assert_eq!(
-            api_backend_for(host, "GET", "/v1/account/moderation-status"),
-            MOBILE_API_BACKEND
-        );
+    fn test_api_backend_accepts_canonical_host_variants() {
+        for host in ["API.divine.video", "api.divine.video:443"] {
+            assert_eq!(classify_host(host), HostType::System("api".to_string()));
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                MOBILE_API_BACKEND
+            );
+        }
     }
 
     #[test]
