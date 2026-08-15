@@ -27,6 +27,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.funnelcake_api]
       url = "https://relay.divine.video"
 
+    [local_server.backends.mobile_api]
+      url = "https://api-relay-prod.divine.video"
+
     [local_server.backends.activitypub_gateway]
       url = "https://divine-activity-pub.protestnet.workers.dev"
 
@@ -61,6 +64,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.funnelcake_api]
       address = "relay.divine.video"
+      port = 443
+
+    [setup.backends.mobile_api]
+      address = "api-relay-prod.divine.video"
       port = 443
 
     [setup.backends.activitypub_gateway]

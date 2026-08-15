@@ -13,6 +13,7 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const MOBILE_API_BACKEND: &str = "mobile_api";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
@@ -33,6 +34,26 @@ fn is_activitypub_path(path: &str) -> bool {
         || path == "/.well-known/nodeinfo"
         || path == "/nodeinfo"
         || path.starts_with("/nodeinfo/")
+}
+
+fn api_backend_for(method: &str, path: &str) -> &'static str {
+    let is_parent_contact_path = path
+        .strip_prefix("/v1/minor-review-cases/")
+        .and_then(|remainder| remainder.strip_suffix("/parent-contact"))
+        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
+    let is_mobile_api_path = path == "/v1/account/moderation-status"
+        || is_parent_contact_path
+        || path == "/api/zendesk/pre-auth";
+    let is_supported_request = (method == "GET" && path == "/v1/account/moderation-status")
+        || (method == "POST" && is_parent_contact_path)
+        || (method == "POST" && path == "/api/zendesk/pre-auth")
+        || (method == "OPTIONS" && is_mobile_api_path);
+
+    if is_supported_request {
+        MOBILE_API_BACKEND
+    } else {
+        FUNNELCAKE_API_BACKEND
+    }
 }
 
 // Subdomains that route to blossom/media server
@@ -123,7 +144,8 @@ fn main(req: Request) -> Result<Response, Error> {
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
             } else if subdomain == "api" {
-                passthrough(req, FUNNELCAKE_API_BACKEND, &host)
+                let backend = api_backend_for(req.get_method_str(), &path);
+                passthrough(req, backend, &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -190,6 +212,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const MOBILE_API_BACKEND_HOST: &str = "api-relay-prod.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +229,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
@@ -1169,6 +1193,7 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            MOBILE_API_BACKEND,
         ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
@@ -1181,6 +1206,35 @@ mod tests {
                 fastly_toml.contains(&setup_backend),
                 "missing setup backend definition for {backend}"
             );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_routes_only_mobile_moderation_contract_to_worker() {
+        for (method, path) in [
+            ("GET", "/v1/account/moderation-status"),
+            ("POST", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/api/zendesk/pre-auth"),
+            ("OPTIONS", "/v1/account/moderation-status"),
+            ("OPTIONS", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("OPTIONS", "/api/zendesk/pre-auth"),
+        ] {
+            assert_eq!(api_backend_for(method, path), MOBILE_API_BACKEND);
+        }
+    }
+
+    #[test]
+    fn test_api_backend_keeps_unrelated_and_wrong_method_requests_on_funnelcake() {
+        for (method, path) in [
+            ("POST", "/v1/account/moderation-status"),
+            ("GET", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/v1/minor-review-cases//parent-contact"),
+            ("POST", "/v1/minor-review-cases/case/extra/parent-contact"),
+            ("GET", "/api/zendesk/pre-auth"),
+            ("GET", "/api/search"),
+            ("POST", "/api/events"),
+        ] {
+            assert_eq!(api_backend_for(method, path), FUNNELCAKE_API_BACKEND);
         }
     }
 
