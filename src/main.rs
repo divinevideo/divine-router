@@ -68,6 +68,10 @@ const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
 // Subdomains that route to invite faucet service
 const INVITE_SUBDOMAINS: &[&str] = &["invite"];
 
+// Reserved system hosts that must not become usernames, but no longer
+// passthrough. Keep these in SYSTEM_SUBDOMAINS so they stay HostType::System.
+const RETIRED_SYSTEM_SUBDOMAINS: &[&str] = &["stream"];
+
 // System subdomains that should passthrough to origin
 const SYSTEM_SUBDOMAINS: &[&str] = &[
     "www",
@@ -145,7 +149,9 @@ fn main(req: Request) -> Result<Response, Error> {
             // Route to appropriate backend based on subdomain
             let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
             let invite_set: HashSet<&str> = INVITE_SUBDOMAINS.iter().copied().collect();
-            if blossom_set.contains(subdomain.as_str()) {
+            if is_retired_system_subdomain(&subdomain) {
+                Ok(retired_system_response())
+            } else if blossom_set.contains(subdomain.as_str()) {
                 passthrough(req, BLOSSOM_BACKEND, &host)
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
@@ -205,6 +211,18 @@ fn classify_host(host: &str) -> HostType {
         // x.y.dvines.org or deeper (multi-level)
         _ => HostType::MultiLevel,
     }
+}
+
+fn is_retired_system_subdomain(subdomain: &str) -> bool {
+    RETIRED_SYSTEM_SUBDOMAINS
+        .iter()
+        .any(|retired| subdomain.eq_ignore_ascii_case(retired))
+}
+
+fn retired_system_response() -> Response {
+    Response::from_status(StatusCode::GONE)
+        .with_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .with_body("Gone\n")
 }
 
 fn is_owned_apex_domain(hostname: &str) -> bool {
@@ -1035,6 +1053,26 @@ mod tests {
             classify_host("media.divine.video"),
             HostType::System("media".to_string())
         );
+        assert_eq!(
+            classify_host("stream.divine.video"),
+            HostType::System("stream".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stream_host_is_retired_not_a_username() {
+        assert_eq!(
+            classify_host("stream.divine.video"),
+            HostType::System("stream".to_string())
+        );
+        assert_eq!(
+            classify_host("stream.dvines.org"),
+            HostType::System("stream".to_string())
+        );
+        assert!(is_retired_system_subdomain("stream"));
+        assert!(is_retired_system_subdomain("STREAM"));
+        assert!(!is_retired_system_subdomain("cdn"));
+        assert!(!is_retired_system_subdomain("media"));
     }
 
     #[test]
