@@ -19,6 +19,8 @@ const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
+const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const RETIRED_SYSTEM_BODY: &str = "Gone\n";
 
 /// Pins eligible API and RSS stale reuse at the edge for 24 hours.
 ///
@@ -220,9 +222,19 @@ fn is_retired_system_subdomain(subdomain: &str) -> bool {
 }
 
 fn retired_system_response() -> Response {
-    Response::from_status(StatusCode::GONE)
-        .with_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .with_body("Gone\n")
+    let (status, content_type, body) = retired_system_response_spec();
+
+    Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, content_type)
+        .with_body(body)
+}
+
+fn retired_system_response_spec() -> (StatusCode, &'static str, &'static str) {
+    (
+        StatusCode::GONE,
+        RETIRED_SYSTEM_CONTENT_TYPE,
+        RETIRED_SYSTEM_BODY,
+    )
 }
 
 fn is_owned_apex_domain(hostname: &str) -> bool {
@@ -1053,10 +1065,6 @@ mod tests {
             classify_host("media.divine.video"),
             HostType::System("media".to_string())
         );
-        assert_eq!(
-            classify_host("stream.divine.video"),
-            HostType::System("stream".to_string())
-        );
     }
 
     #[test]
@@ -1073,6 +1081,27 @@ mod tests {
         assert!(is_retired_system_subdomain("STREAM"));
         assert!(!is_retired_system_subdomain("cdn"));
         assert!(!is_retired_system_subdomain("media"));
+    }
+
+    #[test]
+    fn test_retired_system_subdomains_remain_reserved() {
+        let system_set: HashSet<&str> = SYSTEM_SUBDOMAINS.iter().copied().collect();
+
+        for retired in RETIRED_SYSTEM_SUBDOMAINS {
+            assert!(
+                system_set.contains(retired),
+                "retired system subdomain must stay reserved: {retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retired_system_response_returns_gone() {
+        let (status, content_type, body) = retired_system_response_spec();
+
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(content_type, "text/plain; charset=utf-8");
+        assert_eq!(body, "Gone\n");
     }
 
     #[test]
