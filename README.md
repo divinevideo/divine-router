@@ -49,7 +49,8 @@ Reserved single-level subdomains are routed by name:
 | `media`, `blossom` | Blossom / media server |
 | `invite` | Invite faucet service |
 | `api` | Funnelcake API; on `api.divine.video` only, the exact mobile API routes below use the mobile API backend |
-| `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `stream`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
+| `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
+| `stream` | Retired. Router returns `410 Gone` and does not passthrough. |
 
 ### Username subdomains (`alice.divine.video`, `alice.dvines.org`)
 

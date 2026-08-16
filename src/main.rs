@@ -19,6 +19,8 @@ const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
+const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const RETIRED_SYSTEM_BODY: &str = "Gone\n";
 
 /// Pins eligible API and RSS stale reuse at the edge for 24 hours.
 ///
@@ -67,6 +69,10 @@ const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
 
 // Subdomains that route to invite faucet service
 const INVITE_SUBDOMAINS: &[&str] = &["invite"];
+
+// Reserved system hosts that must not become usernames, but no longer
+// passthrough. Keep these in SYSTEM_SUBDOMAINS so they stay HostType::System.
+const RETIRED_SYSTEM_SUBDOMAINS: &[&str] = &["stream"];
 
 // System subdomains that should passthrough to origin
 const SYSTEM_SUBDOMAINS: &[&str] = &[
@@ -145,7 +151,9 @@ fn main(req: Request) -> Result<Response, Error> {
             // Route to appropriate backend based on subdomain
             let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
             let invite_set: HashSet<&str> = INVITE_SUBDOMAINS.iter().copied().collect();
-            if blossom_set.contains(subdomain.as_str()) {
+            if is_retired_system_subdomain(&subdomain) {
+                Ok(retired_system_response())
+            } else if blossom_set.contains(subdomain.as_str()) {
                 passthrough(req, BLOSSOM_BACKEND, &host)
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
@@ -205,6 +213,28 @@ fn classify_host(host: &str) -> HostType {
         // x.y.dvines.org or deeper (multi-level)
         _ => HostType::MultiLevel,
     }
+}
+
+fn is_retired_system_subdomain(subdomain: &str) -> bool {
+    RETIRED_SYSTEM_SUBDOMAINS
+        .iter()
+        .any(|retired| subdomain.eq_ignore_ascii_case(retired))
+}
+
+fn retired_system_response() -> Response {
+    let (status, content_type, body) = retired_system_response_spec();
+
+    Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, content_type)
+        .with_body(body)
+}
+
+fn retired_system_response_spec() -> (StatusCode, &'static str, &'static str) {
+    (
+        StatusCode::GONE,
+        RETIRED_SYSTEM_CONTENT_TYPE,
+        RETIRED_SYSTEM_BODY,
+    )
 }
 
 fn is_owned_apex_domain(hostname: &str) -> bool {
@@ -1035,6 +1065,43 @@ mod tests {
             classify_host("media.divine.video"),
             HostType::System("media".to_string())
         );
+    }
+
+    #[test]
+    fn test_stream_host_is_retired_not_a_username() {
+        assert_eq!(
+            classify_host("stream.divine.video"),
+            HostType::System("stream".to_string())
+        );
+        assert_eq!(
+            classify_host("stream.dvines.org"),
+            HostType::System("stream".to_string())
+        );
+        assert!(is_retired_system_subdomain("stream"));
+        assert!(is_retired_system_subdomain("STREAM"));
+        assert!(!is_retired_system_subdomain("cdn"));
+        assert!(!is_retired_system_subdomain("media"));
+    }
+
+    #[test]
+    fn test_retired_system_subdomains_remain_reserved() {
+        let system_set: HashSet<&str> = SYSTEM_SUBDOMAINS.iter().copied().collect();
+
+        for retired in RETIRED_SYSTEM_SUBDOMAINS {
+            assert!(
+                system_set.contains(retired),
+                "retired system subdomain must stay reserved: {retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retired_system_response_returns_gone() {
+        let (status, content_type, body) = retired_system_response_spec();
+
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(content_type, "text/plain; charset=utf-8");
+        assert_eq!(body, "Gone\n");
     }
 
     #[test]
