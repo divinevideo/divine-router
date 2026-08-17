@@ -475,9 +475,21 @@ fn passthrough_cache_mode(
     }
 }
 
-/// Collapse a client `Accept-Encoding` header into the one encoding we will
-/// actually serve, or `None` when we should serve identity.
-///
+/// Only normalize where the origin currently varies on `Accept-Encoding`.
+/// A `pass` request is never stored, so rewriting its `Accept-Encoding` would
+/// change what the client receives while collapsing nothing.
+fn should_normalize_accept_encoding(
+    cache_mode: PassthroughCacheMode,
+    backend: &str,
+    host: &str,
+    path: &str,
+) -> bool {
+    matches!(cache_mode, PassthroughCacheMode::Cacheable { .. })
+        && backend == FUNNELCAKE_API_BACKEND
+        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api")
+        && path.starts_with("/api/")
+}
+
 /// Fastly keys a cached object on the request header, and the API sends
 /// `Vary: Accept-Encoding`, so without this every distinct header *string*
 /// becomes its own object for byte-identical content. Measured against
@@ -494,16 +506,12 @@ fn passthrough_cache_mode(
 /// Quality values are parsed rather than substring-matched. `br;q=0` is an
 /// explicit refusal, and treating it as an offer would serve brotli to a
 /// client that asked us not to.
-/// Only cacheable requests are normalized. A `pass` request is never stored,
-/// so rewriting its `Accept-Encoding` would change what the client receives
-/// while collapsing nothing.
-fn should_normalize_accept_encoding(cache_mode: PassthroughCacheMode) -> bool {
-    matches!(cache_mode, PassthroughCacheMode::Cacheable { .. })
-}
-
 fn normalized_accept_encoding(header: &str) -> Option<&'static str> {
+    let mut accepts_any = false;
     let mut accepts_brotli = false;
     let mut accepts_gzip = false;
+    let mut refuses_brotli = false;
+    let mut refuses_gzip = false;
 
     for token in header.split(',') {
         let mut parts = token.split(';');
@@ -511,23 +519,32 @@ fn normalized_accept_encoding(header: &str) -> Option<&'static str> {
         let refused = parts.any(|param| {
             let param = param.trim();
             param
-                .strip_prefix("q=")
-                .map(|q| q.trim().parse::<f32>().map(|q| q <= 0.0).unwrap_or(false))
+                .split_once('=')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, q)| q.trim().parse::<f32>().map(|q| q <= 0.0).unwrap_or(false))
                 .unwrap_or(false)
         });
-        if refused {
-            continue;
-        }
+
         if coding.eq_ignore_ascii_case("br") {
-            accepts_brotli = true;
+            if refused {
+                refuses_brotli = true;
+            } else {
+                accepts_brotli = true;
+            }
         } else if coding.eq_ignore_ascii_case("gzip") {
-            accepts_gzip = true;
+            if refused {
+                refuses_gzip = true;
+            } else {
+                accepts_gzip = true;
+            }
+        } else if coding == "*" {
+            accepts_any = !refused;
         }
     }
 
-    if accepts_brotli {
+    if accepts_brotli || (accepts_any && !refuses_brotli) {
         Some("br")
-    } else if accepts_gzip {
+    } else if accepts_gzip || (accepts_any && !refuses_gzip) {
         Some("gzip")
     } else {
         None
@@ -593,7 +610,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         }
     }
 
-    if should_normalize_accept_encoding(cache_mode) {
+    if should_normalize_accept_encoding(cache_mode, backend, original_host, &path) {
         let normalized = req
             .get_header_str(header::ACCEPT_ENCODING)
             .and_then(normalized_accept_encoding);
@@ -1883,15 +1900,48 @@ mod tests {
     /// stored. The rewrite only earns its correctness cost where it buys a
     /// cache hit.
     #[test]
-    fn test_accept_encoding_is_normalized_only_for_cacheable_requests() {
+    fn test_accept_encoding_is_normalized_only_for_cacheable_funnelcake_api_requests() {
         assert!(should_normalize_accept_encoding(
             PassthroughCacheMode::Cacheable {
                 fallback_ttl_secs: Some(30),
                 honors_origin_stale_if_error: false,
-            }
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
         ));
         assert!(!should_normalize_accept_encoding(
-            PassthroughCacheMode::Pass
+            PassthroughCacheMode::Pass,
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            MAIN_BACKEND,
+            "www.divine.video",
+            "/"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "relay.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/feed/global.xml"
         ));
     }
 
@@ -1932,9 +1982,23 @@ mod tests {
     #[test]
     fn test_normalize_accept_encoding_honours_zero_quality() {
         assert_eq!(normalized_accept_encoding("br;q=0, gzip"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;Q=0, gzip"), Some("gzip"));
+        assert_eq!(
+            normalized_accept_encoding("br ; q = 0 , gzip"),
+            Some("gzip")
+        );
         assert_eq!(normalized_accept_encoding("br;q=0.0, gzip"), Some("gzip"));
         assert_eq!(normalized_accept_encoding("gzip;q=0, br"), Some("br"));
         assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0"), None);
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_honours_wildcard() {
+        assert_eq!(normalized_accept_encoding("*"), Some("br"));
+        assert_eq!(normalized_accept_encoding("gzip;q=0, *"), Some("br"));
+        assert_eq!(normalized_accept_encoding("br;q=0, *"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0, *"), None);
+        assert_eq!(normalized_accept_encoding("*;q=0, gzip"), Some("gzip"));
     }
 
     #[test]
