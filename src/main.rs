@@ -475,6 +475,82 @@ fn passthrough_cache_mode(
     }
 }
 
+/// Only normalize where the origin currently varies on `Accept-Encoding`.
+/// A `pass` request is never stored, so rewriting its `Accept-Encoding` would
+/// change what the client receives while collapsing nothing.
+fn should_normalize_accept_encoding(
+    cache_mode: PassthroughCacheMode,
+    backend: &str,
+    host: &str,
+    path: &str,
+) -> bool {
+    matches!(cache_mode, PassthroughCacheMode::Cacheable { .. })
+        && backend == FUNNELCAKE_API_BACKEND
+        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api")
+        && path.starts_with("/api/")
+}
+
+/// Fastly keys a cached object on the request header, and the API sends
+/// `Vary: Accept-Encoding`, so without this every distinct header *string*
+/// becomes its own object for byte-identical content. Measured against
+/// production on 2026-08-17, one warmed URL: `gzip` HIT, then
+/// `gzip, deflate` MISS, `gzip, deflate, br` MISS, `br, gzip` MISS,
+/// `gzip, deflate, br, zstd` MISS, `identity` MISS. Clients differ freely
+/// here — Chrome sends `gzip, deflate, br, zstd`, Dart's http package sends
+/// `gzip` — so one URL fragments across many objects, each filled from the
+/// slow ClickHouse origin independently.
+///
+/// Brotli is preferred where offered: a 50-video category page measures
+/// 1,820,406 bytes identity, 257,497 gzip, 116,821 brotli.
+///
+/// Quality values are parsed rather than substring-matched. `br;q=0` is an
+/// explicit refusal, and treating it as an offer would serve brotli to a
+/// client that asked us not to.
+fn normalized_accept_encoding(header: &str) -> Option<&'static str> {
+    let mut accepts_any = false;
+    let mut accepts_brotli = false;
+    let mut accepts_gzip = false;
+    let mut refuses_brotli = false;
+    let mut refuses_gzip = false;
+
+    for token in header.split(',') {
+        let mut parts = token.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let refused = parts.any(|param| {
+            let param = param.trim();
+            param
+                .split_once('=')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, q)| q.trim().parse::<f32>().map(|q| q <= 0.0).unwrap_or(false))
+                .unwrap_or(false)
+        });
+
+        if coding.eq_ignore_ascii_case("br") {
+            if refused {
+                refuses_brotli = true;
+            } else {
+                accepts_brotli = true;
+            }
+        } else if coding.eq_ignore_ascii_case("gzip") {
+            if refused {
+                refuses_gzip = true;
+            } else {
+                accepts_gzip = true;
+            }
+        } else if coding == "*" {
+            accepts_any = !refused;
+        }
+    }
+
+    if accepts_brotli || (accepts_any && !refuses_brotli) {
+        Some("br")
+    } else if accepts_gzip || (accepts_any && !refuses_gzip) {
+        Some("gzip")
+    } else {
+        None
+    }
+}
+
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
     let mut req = req;
     let path = req.get_path().to_string();
@@ -530,6 +606,18 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
                         CandidateCacheAction::PreserveOrigin => Ok(()),
                     }
                 });
+            }
+        }
+    }
+
+    if should_normalize_accept_encoding(cache_mode, backend, original_host, &path) {
+        let normalized = req
+            .get_header_str(header::ACCEPT_ENCODING)
+            .and_then(normalized_accept_encoding);
+        match normalized {
+            Some(encoding) => req.set_header(header::ACCEPT_ENCODING, encoding),
+            None => {
+                req.remove_header(header::ACCEPT_ENCODING);
             }
         }
     }
@@ -1805,6 +1893,121 @@ mod tests {
             candidate_cache_action(false, false, false, false, Duration::ZERO, None),
             CandidateCacheAction::PreserveOrigin
         );
+    }
+
+    /// Normalizing a `pass` request would rewrite what the client receives
+    /// without collapsing any cache key, since pass requests are never
+    /// stored. The rewrite only earns its correctness cost where it buys a
+    /// cache hit.
+    #[test]
+    fn test_accept_encoding_is_normalized_only_for_cacheable_funnelcake_api_requests() {
+        assert!(should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: Some(30),
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Pass,
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            MAIN_BACKEND,
+            "www.divine.video",
+            "/"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "relay.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/feed/global.xml"
+        ));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_prefers_brotli() {
+        assert_eq!(
+            normalized_accept_encoding("gzip, deflate, br, zstd"),
+            Some("br")
+        );
+        assert_eq!(normalized_accept_encoding("br"), Some("br"));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_collapses_gzip_variants() {
+        for header in ["gzip", "gzip, deflate", "deflate, gzip", "gzip;q=1.0"] {
+            assert_eq!(
+                normalized_accept_encoding(header),
+                Some("gzip"),
+                "header {header} should collapse to gzip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_drops_unusable_encodings() {
+        for header in ["identity", "deflate", "", "zstd"] {
+            assert_eq!(
+                normalized_accept_encoding(header),
+                None,
+                "header {header} advertises nothing we serve"
+            );
+        }
+    }
+
+    /// The VCL draft matched substrings, so `br;q=0` — an explicit refusal —
+    /// would have been normalized to `br` and served brotli the client said
+    /// it did not want.
+    #[test]
+    fn test_normalize_accept_encoding_honours_zero_quality() {
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;Q=0, gzip"), Some("gzip"));
+        assert_eq!(
+            normalized_accept_encoding("br ; q = 0 , gzip"),
+            Some("gzip")
+        );
+        assert_eq!(normalized_accept_encoding("br;q=0.0, gzip"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("gzip;q=0, br"), Some("br"));
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0"), None);
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_honours_wildcard() {
+        assert_eq!(normalized_accept_encoding("*"), Some("br"));
+        assert_eq!(normalized_accept_encoding("gzip;q=0, *"), Some("br"));
+        assert_eq!(normalized_accept_encoding("br;q=0, *"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0, *"), None);
+        assert_eq!(normalized_accept_encoding("*;q=0, gzip"), Some("gzip"));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_ignores_case_and_whitespace() {
+        assert_eq!(
+            normalized_accept_encoding("  GZIP , Deflate "),
+            Some("gzip")
+        );
+        assert_eq!(normalized_accept_encoding("BR"), Some("br"));
     }
 
     #[test]
