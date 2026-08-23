@@ -1,6 +1,7 @@
 // ABOUTME: Divine Router - Fastly edge router for wildcard subdomains
 // ABOUTME: Routes username.divine.video to profiles, passes through system subdomains
 
+use fastly::http::request::SendErrorCause;
 use fastly::http::{StatusCode, header};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
@@ -12,11 +13,21 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const MOBILE_API_BACKEND: &str = "mobile_api";
 const SOUND_PROXY_BACKEND: &str = "sound_proxy";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
+const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
+const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const RETIRED_SYSTEM_BODY: &str = "Gone\n";
+
+/// Pins eligible API and RSS stale reuse at the edge for 24 hours.
+///
+/// This matches Funnelcake's intended cache contract without depending on its
+/// deployment state or Fastly defaults. Coordinate changes with origin policy.
+const EDGE_STALE_IF_ERROR_SECS: u32 = 24 * 60 * 60;
 
 // ActivityPub gateway paths served on the divine.video apex by the
 // divine-activity-pub worker (actors, outbox, inbox, nodeinfo). NOTE: WebFinger
@@ -29,11 +40,47 @@ fn is_activitypub_path(path: &str) -> bool {
         || path.starts_with("/nodeinfo/")
 }
 
+fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
+    let hostname = host.split(':').next().unwrap_or(host);
+    if !hostname.eq_ignore_ascii_case(CANONICAL_API_HOST) {
+        return FUNNELCAKE_API_BACKEND;
+    }
+
+    let is_parent_contact_path = path
+        .strip_prefix("/v1/minor-review-cases/")
+        .and_then(|remainder| remainder.strip_suffix("/parent-contact"))
+        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
+    let is_mobile_api_path = path == "/v1/account/moderation-status"
+        || is_parent_contact_path
+        || path == "/api/zendesk/pre-auth";
+    let is_supported_request = (method == "GET" && path == "/v1/account/moderation-status")
+        || (method == "POST" && is_parent_contact_path)
+        || (method == "POST" && path == "/api/zendesk/pre-auth")
+        || (method == "OPTIONS" && is_mobile_api_path);
+
+    if is_supported_request {
+        return MOBILE_API_BACKEND;
+    }
+
+    // Reached only for api.divine.video: the canonical-host gate above sends
+    // api.dvines.org to Funnelcake whole, so the sound cutover is scoped to one
+    // domain without a second host check.
+    if is_sound_proxy_path(path) {
+        return SOUND_PROXY_BACKEND;
+    }
+
+    FUNNELCAKE_API_BACKEND
+}
+
 // Subdomains that route to blossom/media server
 const BLOSSOM_SUBDOMAINS: &[&str] = &["media", "blossom"];
 
 // Subdomains that route to invite faucet service
 const INVITE_SUBDOMAINS: &[&str] = &["invite"];
+
+// Reserved system hosts that must not become usernames, but no longer
+// passthrough. Keep these in SYSTEM_SUBDOMAINS so they stay HostType::System.
+const RETIRED_SYSTEM_SUBDOMAINS: &[&str] = &["stream"];
 
 // System subdomains that should passthrough to origin
 const SYSTEM_SUBDOMAINS: &[&str] = &[
@@ -112,12 +159,15 @@ fn main(req: Request) -> Result<Response, Error> {
             // Route to appropriate backend based on subdomain
             let blossom_set: HashSet<&str> = BLOSSOM_SUBDOMAINS.iter().copied().collect();
             let invite_set: HashSet<&str> = INVITE_SUBDOMAINS.iter().copied().collect();
-            if blossom_set.contains(subdomain.as_str()) {
+            if is_retired_system_subdomain(&subdomain) {
+                Ok(retired_system_response())
+            } else if blossom_set.contains(subdomain.as_str()) {
                 passthrough(req, BLOSSOM_BACKEND, &host)
             } else if invite_set.contains(subdomain.as_str()) {
                 passthrough(req, INVITE_BACKEND, &host)
             } else if subdomain == "api" {
-                passthrough(req, api_backend_for_path(&path), &host)
+                let backend = api_backend_for(&host, req.get_method_str(), &path);
+                passthrough(req, backend, &host)
             } else {
                 passthrough(req, MAIN_BACKEND, &host)
             }
@@ -173,6 +223,28 @@ fn classify_host(host: &str) -> HostType {
     }
 }
 
+fn is_retired_system_subdomain(subdomain: &str) -> bool {
+    RETIRED_SYSTEM_SUBDOMAINS
+        .iter()
+        .any(|retired| subdomain.eq_ignore_ascii_case(retired))
+}
+
+fn retired_system_response() -> Response {
+    let (status, content_type, body) = retired_system_response_spec();
+
+    Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, content_type)
+        .with_body(body)
+}
+
+fn retired_system_response_spec() -> (StatusCode, &'static str, &'static str) {
+    (
+        StatusCode::GONE,
+        RETIRED_SYSTEM_CONTENT_TYPE,
+        RETIRED_SYSTEM_BODY,
+    )
+}
+
 fn is_owned_apex_domain(hostname: &str) -> bool {
     OWNED_APEX_DOMAINS
         .iter()
@@ -184,12 +256,14 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const MOBILE_API_BACKEND_HOST: &str = "api-relay-prod.divine.video";
 const SOUND_PROXY_BACKEND_HOST: &str = "sounds.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PassthroughHeaders<'a> {
     backend_host: &'static str,
+    original_host: &'a str,
     forwarded_host: &'a str,
     forwarded_proto: &'a str,
 }
@@ -200,6 +274,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
         SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
@@ -228,14 +303,6 @@ fn is_sound_proxy_path(path: &str) -> bool {
     SOUND_PROXY_API_PATHS.contains(&path) || is_sound_proxy_videos_path(path)
 }
 
-fn api_backend_for_path(path: &str) -> &'static str {
-    if is_sound_proxy_path(path) {
-        SOUND_PROXY_BACKEND
-    } else {
-        FUNNELCAKE_API_BACKEND
-    }
-}
-
 fn passthrough_headers<'a>(
     backend: &str,
     original_host: &'a str,
@@ -243,9 +310,30 @@ fn passthrough_headers<'a>(
 ) -> PassthroughHeaders<'a> {
     PassthroughHeaders {
         backend_host: backend_host_for(backend),
+        original_host,
         forwarded_host: original_host,
         forwarded_proto: original_proto,
     }
+}
+
+trait PassthroughHeaderTarget {
+    fn overwrite_header(&mut self, name: &'static str, value: &str);
+}
+
+impl PassthroughHeaderTarget for Request {
+    fn overwrite_header(&mut self, name: &'static str, value: &str) {
+        self.set_header(name, value);
+    }
+}
+
+fn apply_passthrough_headers(
+    req: &mut impl PassthroughHeaderTarget,
+    headers: PassthroughHeaders<'_>,
+) {
+    req.overwrite_header("host", headers.backend_host);
+    req.overwrite_header("x-original-host", headers.original_host);
+    req.overwrite_header("x-forwarded-host", headers.forwarded_host);
+    req.overwrite_header("x-forwarded-proto", headers.forwarded_proto);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +345,31 @@ struct ApiCachePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassthroughCacheMode {
     Pass,
-    Cacheable { fallback_ttl_secs: Option<u32> },
+    Cacheable {
+        fallback_ttl_secs: Option<u32>,
+        honors_origin_stale_if_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateCacheAction {
+    ServeStale,
+    SetFallbackTtl(Duration),
+    PreserveOrigin,
+}
+
+fn stale_if_error_override_secs(cache_mode: PassthroughCacheMode) -> Option<u32> {
+    match cache_mode {
+        PassthroughCacheMode::Pass => None,
+        PassthroughCacheMode::Cacheable {
+            honors_origin_stale_if_error,
+            ..
+        } => Some(if honors_origin_stale_if_error {
+            EDGE_STALE_IF_ERROR_SECS
+        } else {
+            0
+        }),
+    }
 }
 
 fn is_public_divine_host(host: &str) -> bool {
@@ -299,31 +411,175 @@ fn api_cache_policy(
     }
 }
 
+fn is_rss_feed_path(path: &str) -> bool {
+    path.starts_with("/feed/")
+}
+
+fn honors_origin_stale_if_error(
+    host: &str,
+    method: &str,
+    path: &str,
+    has_authorization: bool,
+    is_websocket_upgrade: bool,
+    policy: ApiCachePolicy,
+) -> bool {
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+
+    is_api_host
+        && method.eq_ignore_ascii_case("GET")
+        && !has_authorization
+        && !is_websocket_upgrade
+        && (policy.cacheable || is_rss_feed_path(path))
+}
+
+fn candidate_cache_action(
+    honors_origin_stale_if_error: bool,
+    is_server_error: bool,
+    stale_if_error_available: bool,
+    has_surrogate_control: bool,
+    response_ttl: Duration,
+    fallback_ttl_secs: Option<u32>,
+) -> CandidateCacheAction {
+    if is_server_error {
+        return if honors_origin_stale_if_error && stale_if_error_available {
+            CandidateCacheAction::ServeStale
+        } else {
+            CandidateCacheAction::PreserveOrigin
+        };
+    }
+
+    if !has_surrogate_control
+        && response_ttl.is_zero()
+        && let Some(ttl_secs) = fallback_ttl_secs
+    {
+        return CandidateCacheAction::SetFallbackTtl(Duration::from_secs(ttl_secs as u64));
+    }
+
+    CandidateCacheAction::PreserveOrigin
+}
+
+fn should_register_cache_hook(
+    fallback_ttl_secs: Option<u32>,
+    honors_origin_stale_if_error: bool,
+) -> bool {
+    fallback_ttl_secs.is_some() || honors_origin_stale_if_error
+}
+
 fn passthrough_cache_mode(
     host: &str,
     method: &str,
     path: &str,
     has_authorization: bool,
     is_websocket_upgrade: bool,
+    backend: &str,
 ) -> PassthroughCacheMode {
     if should_bypass_cache(host, path) || is_websocket_upgrade {
         return PassthroughCacheMode::Pass;
     }
 
-    if path.starts_with("/api/") {
-        let policy = api_cache_policy(host, method, path, has_authorization, is_websocket_upgrade);
+    let is_api_host =
+        matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
+    if backend == MOBILE_API_BACKEND {
+        return PassthroughCacheMode::Pass;
+    }
 
-        if !policy.cacheable {
-            return PassthroughCacheMode::Pass;
-        }
+    let policy = api_cache_policy(host, method, path, has_authorization, is_websocket_upgrade);
+    let honors_origin_stale_if_error = honors_origin_stale_if_error(
+        host,
+        method,
+        path,
+        has_authorization,
+        is_websocket_upgrade,
+        policy,
+    );
+    let is_api_rss_path = is_rss_feed_path(path) && is_api_host;
 
-        return PassthroughCacheMode::Cacheable {
-            fallback_ttl_secs: policy.fallback_ttl_secs,
-        };
+    if (path.starts_with("/api/") && !policy.cacheable)
+        || (is_api_rss_path && !honors_origin_stale_if_error)
+    {
+        return PassthroughCacheMode::Pass;
     }
 
     PassthroughCacheMode::Cacheable {
-        fallback_ttl_secs: None,
+        fallback_ttl_secs: policy.fallback_ttl_secs,
+        honors_origin_stale_if_error,
+    }
+}
+
+/// Only normalize where the origin currently varies on `Accept-Encoding`.
+/// A `pass` request is never stored, so rewriting its `Accept-Encoding` would
+/// change what the client receives while collapsing nothing.
+fn should_normalize_accept_encoding(
+    cache_mode: PassthroughCacheMode,
+    backend: &str,
+    host: &str,
+    path: &str,
+) -> bool {
+    matches!(cache_mode, PassthroughCacheMode::Cacheable { .. })
+        && backend == FUNNELCAKE_API_BACKEND
+        && matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api")
+        && path.starts_with("/api/")
+}
+
+/// Fastly keys a cached object on the request header, and the API sends
+/// `Vary: Accept-Encoding`, so without this every distinct header *string*
+/// becomes its own object for byte-identical content. Measured against
+/// production on 2026-08-17, one warmed URL: `gzip` HIT, then
+/// `gzip, deflate` MISS, `gzip, deflate, br` MISS, `br, gzip` MISS,
+/// `gzip, deflate, br, zstd` MISS, `identity` MISS. Clients differ freely
+/// here — Chrome sends `gzip, deflate, br, zstd`, Dart's http package sends
+/// `gzip` — so one URL fragments across many objects, each filled from the
+/// slow ClickHouse origin independently.
+///
+/// Brotli is preferred where offered: a 50-video category page measures
+/// 1,820,406 bytes identity, 257,497 gzip, 116,821 brotli.
+///
+/// Quality values are parsed rather than substring-matched. `br;q=0` is an
+/// explicit refusal, and treating it as an offer would serve brotli to a
+/// client that asked us not to.
+fn normalized_accept_encoding(header: &str) -> Option<&'static str> {
+    let mut accepts_any = false;
+    let mut accepts_brotli = false;
+    let mut accepts_gzip = false;
+    let mut refuses_brotli = false;
+    let mut refuses_gzip = false;
+
+    for token in header.split(',') {
+        let mut parts = token.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let refused = parts.any(|param| {
+            let param = param.trim();
+            param
+                .split_once('=')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, q)| q.trim().parse::<f32>().map(|q| q <= 0.0).unwrap_or(false))
+                .unwrap_or(false)
+        });
+
+        if coding.eq_ignore_ascii_case("br") {
+            if refused {
+                refuses_brotli = true;
+            } else {
+                accepts_brotli = true;
+            }
+        } else if coding.eq_ignore_ascii_case("gzip") {
+            if refused {
+                refuses_gzip = true;
+            } else {
+                accepts_gzip = true;
+            }
+        } else if coding == "*" {
+            accepts_any = !refused;
+        }
+    }
+
+    if accepts_brotli || (accepts_any && !refuses_brotli) {
+        Some("br")
+    } else if accepts_gzip || (accepts_any && !refuses_gzip) {
+        Some("gzip")
+    } else {
+        None
     }
 }
 
@@ -346,27 +602,59 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         &path,
         has_authorization,
         is_websocket_upgrade,
+        backend,
     );
+
+    // Pin eligible API/RSS stale reuse at the edge. Ordinary cacheable routes retain the
+    // zero-second opt-out, while pass routes receive no override that could reverse pass mode.
+    if let Some(stale_if_error_secs) = stale_if_error_override_secs(cache_mode) {
+        req.set_stale_if_error(stale_if_error_secs);
+    }
 
     match cache_mode {
         PassthroughCacheMode::Pass => req.set_pass(true),
-        PassthroughCacheMode::Cacheable { fallback_ttl_secs } => {
-            // Opt out of fastly 0.13's stale-if-error default to preserve prior 5xx surfacing.
-            req.set_stale_if_error(0);
-            if let Some(ttl_secs) = fallback_ttl_secs {
+        PassthroughCacheMode::Cacheable {
+            fallback_ttl_secs,
+            honors_origin_stale_if_error,
+        } => {
+            if should_register_cache_hook(fallback_ttl_secs, honors_origin_stale_if_error) {
                 req.set_after_send(move |candidate| {
-                    if !candidate.contains_header("surrogate-control") {
-                        candidate.set_ttl(Duration::from_secs(ttl_secs as u64));
+                    match candidate_cache_action(
+                        honors_origin_stale_if_error,
+                        candidate.get_status().is_server_error(),
+                        candidate.stale_if_error_available(),
+                        candidate.contains_header("surrogate-control"),
+                        candidate.get_ttl(),
+                        fallback_ttl_secs,
+                    ) {
+                        CandidateCacheAction::ServeStale => {
+                            // An after-send error discards the 5xx candidate and serves available stale.
+                            Err(SendErrorCause::DestinationUnavailable)
+                        }
+                        CandidateCacheAction::SetFallbackTtl(ttl) => {
+                            candidate.set_ttl(ttl);
+                            Ok(())
+                        }
+                        CandidateCacheAction::PreserveOrigin => Ok(()),
                     }
-                    Ok(())
                 });
             }
         }
     }
 
-    req.set_header(header::HOST, headers.backend_host);
-    req.set_header("X-Forwarded-Host", headers.forwarded_host);
-    req.set_header("X-Forwarded-Proto", headers.forwarded_proto);
+    if should_normalize_accept_encoding(cache_mode, backend, original_host, &path) {
+        let normalized = req
+            .get_header_str(header::ACCEPT_ENCODING)
+            .and_then(normalized_accept_encoding);
+        match normalized {
+            Some(encoding) => req.set_header(header::ACCEPT_ENCODING, encoding),
+            None => {
+                req.remove_header(header::ACCEPT_ENCODING);
+            }
+        }
+    }
+
+    apply_passthrough_headers(&mut req, headers);
     Ok(req.send(backend)?)
 }
 
@@ -687,6 +975,15 @@ fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    impl PassthroughHeaderTarget for http::Request<()> {
+        fn overwrite_header(&mut self, name: &'static str, value: &str) {
+            self.headers_mut().insert(
+                http::header::HeaderName::from_static(name),
+                http::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+    }
+
     fn make_active_user(pubkey: &str, relays: Vec<String>) -> UsernameData {
         UsernameData {
             pubkey: pubkey.to_string(),
@@ -891,6 +1188,43 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_host_is_retired_not_a_username() {
+        assert_eq!(
+            classify_host("stream.divine.video"),
+            HostType::System("stream".to_string())
+        );
+        assert_eq!(
+            classify_host("stream.dvines.org"),
+            HostType::System("stream".to_string())
+        );
+        assert!(is_retired_system_subdomain("stream"));
+        assert!(is_retired_system_subdomain("STREAM"));
+        assert!(!is_retired_system_subdomain("cdn"));
+        assert!(!is_retired_system_subdomain("media"));
+    }
+
+    #[test]
+    fn test_retired_system_subdomains_remain_reserved() {
+        let system_set: HashSet<&str> = SYSTEM_SUBDOMAINS.iter().copied().collect();
+
+        for retired in RETIRED_SYSTEM_SUBDOMAINS {
+            assert!(
+                system_set.contains(retired),
+                "retired system subdomain must stay reserved: {retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retired_system_response_returns_gone() {
+        let (status, content_type, body) = retired_system_response_spec();
+
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(content_type, "text/plain; charset=utf-8");
+        assert_eq!(body, "Gone\n");
+    }
+
+    #[test]
     fn test_classify_host_username_subdomain() {
         assert_eq!(
             classify_host("daniel.divine.video"),
@@ -1059,6 +1393,7 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            MOBILE_API_BACKEND,
             SOUND_PROXY_BACKEND,
             ACTIVITYPUB_BACKEND,
         ] {
@@ -1072,6 +1407,62 @@ mod tests {
             assert!(
                 fastly_toml.contains(&setup_backend),
                 "missing setup backend definition for {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_routes_only_mobile_moderation_contract_to_worker() {
+        for (method, path) in [
+            ("GET", "/v1/account/moderation-status"),
+            ("POST", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/api/zendesk/pre-auth"),
+            ("OPTIONS", "/v1/account/moderation-status"),
+            ("OPTIONS", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("OPTIONS", "/api/zendesk/pre-auth"),
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, method, path),
+                MOBILE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_keeps_unrelated_and_wrong_method_requests_on_funnelcake() {
+        for (method, path) in [
+            ("POST", "/v1/account/moderation-status"),
+            ("GET", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/v1/minor-review-cases//parent-contact"),
+            ("POST", "/v1/minor-review-cases/case/extra/parent-contact"),
+            ("GET", "/api/zendesk/pre-auth"),
+            ("GET", "/api/search"),
+            ("POST", "/api/events"),
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, method, path),
+                FUNNELCAKE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_keeps_mobile_routes_on_funnelcake_for_other_hosts() {
+        for host in ["api.dvines.org", "api.example.com"] {
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                FUNNELCAKE_API_BACKEND
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_backend_accepts_canonical_host_variants() {
+        for host in ["API.divine.video", "api.divine.video:443"] {
+            assert_eq!(classify_host(host), HostType::System("api".to_string()));
+            assert_eq!(
+                api_backend_for(host, "GET", "/v1/account/moderation-status"),
+                MOBILE_API_BACKEND
             );
         }
     }
@@ -1141,9 +1532,29 @@ mod tests {
             "/api/sounds/evt123/videos",
         ] {
             assert_eq!(
-                api_backend_for_path(path),
+                api_backend_for(CANONICAL_API_HOST, "GET", path),
                 SOUND_PROXY_BACKEND,
                 "{path} should route to the sound proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sound_proxy_cutover_is_scoped_to_the_canonical_api_host() {
+        // classify_host maps `api` on either owned apex to System("api"), so
+        // without the canonical-host gate in api_backend_for this cutover would
+        // silently divert api.dvines.org too. That domain serves today and is
+        // not part of this change.
+        for path in [
+            "/api/sounds/providers",
+            "/api/sounds/search",
+            "/api/sounds/trending",
+            "/api/sounds/evt123/videos",
+        ] {
+            assert_eq!(
+                api_backend_for("api.dvines.org", "GET", path),
+                FUNNELCAKE_API_BACKEND,
+                "{path} on api.dvines.org must stay on Funnelcake"
             );
         }
     }
@@ -1165,7 +1576,7 @@ mod tests {
             "/api/sounds/trending/weekly",
         ] {
             assert_eq!(
-                api_backend_for_path(path),
+                api_backend_for(CANONICAL_API_HOST, "GET", path),
                 FUNNELCAKE_API_BACKEND,
                 "{path} is not implemented by the sound proxy"
             );
@@ -1174,10 +1585,16 @@ mod tests {
 
     #[test]
     fn test_api_non_sound_paths_still_route_to_funnelcake_backend() {
-        assert_eq!(api_backend_for_path("/api/search"), FUNNELCAKE_API_BACKEND);
-        assert_eq!(api_backend_for_path("/api/events"), FUNNELCAKE_API_BACKEND);
         assert_eq!(
-            api_backend_for_path("/api/sounds-v2"),
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/search"),
+            FUNNELCAKE_API_BACKEND
+        );
+        assert_eq!(
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/events"),
+            FUNNELCAKE_API_BACKEND
+        );
+        assert_eq!(
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/sounds-v2"),
             FUNNELCAKE_API_BACKEND
         );
     }
@@ -1195,7 +1612,8 @@ mod tests {
                 "GET",
                 "/.well-known/webfinger",
                 false,
-                false
+                false,
+                MAIN_BACKEND,
             ),
             PassthroughCacheMode::Pass
         );
@@ -1205,7 +1623,8 @@ mod tests {
                 "GET",
                 "/.well-known/assetlinks.json",
                 false,
-                false
+                false,
+                FUNNELCAKE_API_BACKEND,
             ),
             PassthroughCacheMode::Pass
         );
@@ -1214,7 +1633,14 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_passes_websocket_upgrades() {
         assert_eq!(
-            passthrough_cache_mode("relay.divine.video", "GET", "/api/search", false, true),
+            passthrough_cache_mode(
+                "relay.divine.video",
+                "GET",
+                "/api/search",
+                false,
+                true,
+                MAIN_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
     }
@@ -1222,25 +1648,165 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_passes_non_cacheable_api_requests() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/search", true, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/search",
+                true,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "POST", "/api/events", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "POST",
+                "/api/events",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
         );
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/docs", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/docs",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_mobile_api_requests() {
+        for (method, path, has_authorization) in [
+            ("GET", "/v1/account/moderation-status", true),
+            ("GET", "/v1/account/moderation-status", false),
+            (
+                "POST",
+                "/v1/minor-review-cases/case-123/parent-contact",
+                true,
+            ),
+            ("POST", "/api/zendesk/pre-auth", true),
+            ("OPTIONS", "/v1/account/moderation-status", false),
+        ] {
+            assert_eq!(
+                passthrough_cache_mode(
+                    "api.divine.video",
+                    method,
+                    path,
+                    has_authorization,
+                    false,
+                    MOBILE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_does_not_pass_unrelated_v1_requests() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/v1/unrelated",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_authenticated_rss_requests() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                true,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_passes_non_get_rss_requests() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "POST",
+                "/feed/global.xml",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
+            PassthroughCacheMode::Pass
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_does_not_honor_rss_outside_api_host() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "www.divine.video",
+                "GET",
+                "/feed/global.xml",
+                false,
+                false,
+                MAIN_BACKEND,
+            ),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }
         );
     }
 
     #[test]
     fn test_passthrough_cache_mode_caches_public_api_gets() {
         assert_eq!(
-            passthrough_cache_mode("api.divine.video", "GET", "/api/search", false, false),
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/api/search",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
             PassthroughCacheMode::Cacheable {
-                fallback_ttl_secs: Some(30)
+                fallback_ttl_secs: Some(30),
+                honors_origin_stale_if_error: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_passthrough_cache_mode_honors_origin_stale_if_error_for_public_rss() {
+        assert_eq!(
+            passthrough_cache_mode(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                false,
+                false,
+                FUNNELCAKE_API_BACKEND,
+            ),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: true,
             }
         );
     }
@@ -1248,11 +1814,315 @@ mod tests {
     #[test]
     fn test_passthrough_cache_mode_uses_default_cache_for_regular_passthrough() {
         assert_eq!(
-            passthrough_cache_mode("www.divine.video", "GET", "/", false, false),
+            passthrough_cache_mode("www.divine.video", "GET", "/", false, false, MAIN_BACKEND),
             PassthroughCacheMode::Cacheable {
-                fallback_ttl_secs: None
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
             }
         );
+    }
+
+    #[test]
+    fn test_after_send_hook_is_limited_to_api_fallback_and_serve_stale_paths() {
+        assert!(!should_register_cache_hook(None, false));
+        assert!(should_register_cache_hook(Some(30), false));
+        assert!(should_register_cache_hook(None, true));
+    }
+
+    #[test]
+    fn test_stale_if_error_override_pins_eligible_edge_window() {
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: true,
+            }),
+            Some(86_400)
+        );
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            stale_if_error_override_secs(PassthroughCacheMode::Pass),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rss_feed_path_matches_feed_children_only() {
+        assert!(is_rss_feed_path("/feed/global.xml"));
+        assert!(is_rss_feed_path("/feed/users/alice"));
+        assert!(!is_rss_feed_path("/feed"));
+        assert!(!is_rss_feed_path("/feedback"));
+    }
+
+    #[test]
+    fn test_honors_origin_stale_if_error_for_cacheable_api_requests() {
+        let policy = api_cache_policy("api.divine.video", "GET", "/api/search", false, false);
+
+        assert!(honors_origin_stale_if_error(
+            "api.divine.video",
+            "GET",
+            "/api/search",
+            false,
+            false,
+            policy,
+        ));
+    }
+
+    #[test]
+    fn test_honors_origin_stale_if_error_for_public_rss_requests() {
+        let policy = api_cache_policy("api.divine.video", "GET", "/feed/global.xml", false, false);
+
+        assert!(honors_origin_stale_if_error(
+            "api.divine.video",
+            "GET",
+            "/feed/global.xml",
+            false,
+            false,
+            policy,
+        ));
+    }
+
+    #[test]
+    fn test_does_not_honor_origin_stale_if_error_for_pass_api_requests() {
+        for (method, path, has_authorization, is_websocket_upgrade) in [
+            ("GET", "/api/search", true, false),
+            ("GET", "/api/search", false, true),
+            ("POST", "/api/events", false, false),
+            ("GET", "/api/docs", false, false),
+        ] {
+            let policy = api_cache_policy(
+                "api.divine.video",
+                method,
+                path,
+                has_authorization,
+                is_websocket_upgrade,
+            );
+
+            assert!(!honors_origin_stale_if_error(
+                "api.divine.video",
+                method,
+                path,
+                has_authorization,
+                is_websocket_upgrade,
+                policy,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_does_not_honor_origin_stale_if_error_for_ineligible_rss_requests() {
+        for (has_authorization, is_websocket_upgrade) in [(true, false), (false, true)] {
+            let policy = api_cache_policy(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                has_authorization,
+                is_websocket_upgrade,
+            );
+
+            assert!(!honors_origin_stale_if_error(
+                "api.divine.video",
+                "GET",
+                "/feed/global.xml",
+                has_authorization,
+                is_websocket_upgrade,
+                policy,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_does_not_honor_origin_stale_if_error_outside_api_host() {
+        for (host, path) in [
+            ("divine.video", "/api/search"),
+            ("www.divine.video", "/feed/global.xml"),
+            ("api.example.com", "/feed/global.xml"),
+        ] {
+            let policy = api_cache_policy(host, "GET", path, false, false);
+
+            assert!(!honors_origin_stale_if_error(
+                host, "GET", path, false, false, policy,
+            ));
+        }
+    }
+
+    #[test]
+    fn test_candidate_cache_action_serves_stale_for_eligible_server_errors() {
+        assert_eq!(
+            candidate_cache_action(true, true, true, false, Duration::ZERO, None),
+            CandidateCacheAction::ServeStale
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_server_errors_without_eligible_stale() {
+        assert_eq!(
+            candidate_cache_action(true, true, false, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+        assert_eq!(
+            candidate_cache_action(false, true, true, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_api_server_errors_without_stale() {
+        assert_eq!(
+            candidate_cache_action(true, true, false, false, Duration::ZERO, Some(30)),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_preserves_explicit_zero_surrogate_ttl() {
+        assert_eq!(
+            candidate_cache_action(true, false, false, true, Duration::ZERO, Some(30)),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    #[test]
+    fn test_candidate_cache_action_uses_fallback_only_for_zero_effective_ttl() {
+        assert_eq!(
+            candidate_cache_action(false, false, false, false, Duration::ZERO, Some(30)),
+            CandidateCacheAction::SetFallbackTtl(Duration::from_secs(30))
+        );
+        assert_eq!(
+            candidate_cache_action(
+                false,
+                false,
+                false,
+                false,
+                Duration::from_secs(120),
+                Some(30),
+            ),
+            CandidateCacheAction::PreserveOrigin
+        );
+        assert_eq!(
+            candidate_cache_action(false, false, false, false, Duration::ZERO, None),
+            CandidateCacheAction::PreserveOrigin
+        );
+    }
+
+    /// Normalizing a `pass` request would rewrite what the client receives
+    /// without collapsing any cache key, since pass requests are never
+    /// stored. The rewrite only earns its correctness cost where it buys a
+    /// cache hit.
+    #[test]
+    fn test_accept_encoding_is_normalized_only_for_cacheable_funnelcake_api_requests() {
+        assert!(should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: Some(30),
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Pass,
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            MAIN_BACKEND,
+            "www.divine.video",
+            "/"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "relay.divine.video",
+            "/api/videos"
+        ));
+        assert!(!should_normalize_accept_encoding(
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs: None,
+                honors_origin_stale_if_error: false,
+            },
+            FUNNELCAKE_API_BACKEND,
+            "api.divine.video",
+            "/feed/global.xml"
+        ));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_prefers_brotli() {
+        assert_eq!(
+            normalized_accept_encoding("gzip, deflate, br, zstd"),
+            Some("br")
+        );
+        assert_eq!(normalized_accept_encoding("br"), Some("br"));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_collapses_gzip_variants() {
+        for header in ["gzip", "gzip, deflate", "deflate, gzip", "gzip;q=1.0"] {
+            assert_eq!(
+                normalized_accept_encoding(header),
+                Some("gzip"),
+                "header {header} should collapse to gzip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_drops_unusable_encodings() {
+        for header in ["identity", "deflate", "", "zstd"] {
+            assert_eq!(
+                normalized_accept_encoding(header),
+                None,
+                "header {header} advertises nothing we serve"
+            );
+        }
+    }
+
+    /// The VCL draft matched substrings, so `br;q=0` — an explicit refusal —
+    /// would have been normalized to `br` and served brotli the client said
+    /// it did not want.
+    #[test]
+    fn test_normalize_accept_encoding_honours_zero_quality() {
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;Q=0, gzip"), Some("gzip"));
+        assert_eq!(
+            normalized_accept_encoding("br ; q = 0 , gzip"),
+            Some("gzip")
+        );
+        assert_eq!(normalized_accept_encoding("br;q=0.0, gzip"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("gzip;q=0, br"), Some("br"));
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0"), None);
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_honours_wildcard() {
+        assert_eq!(normalized_accept_encoding("*"), Some("br"));
+        assert_eq!(normalized_accept_encoding("gzip;q=0, *"), Some("br"));
+        assert_eq!(normalized_accept_encoding("br;q=0, *"), Some("gzip"));
+        assert_eq!(normalized_accept_encoding("br;q=0, gzip;q=0, *"), None);
+        assert_eq!(normalized_accept_encoding("*;q=0, gzip"), Some("gzip"));
+    }
+
+    #[test]
+    fn test_normalize_accept_encoding_ignores_case_and_whitespace() {
+        assert_eq!(
+            normalized_accept_encoding("  GZIP , Deflate "),
+            Some("gzip")
+        );
+        assert_eq!(normalized_accept_encoding("BR"), Some("br"));
     }
 
     #[test]
@@ -1260,8 +2130,57 @@ mod tests {
         let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, "api.divine.video", "https");
 
         assert_eq!(headers.backend_host, FUNNELCAKE_BACKEND_HOST);
+        assert_eq!(headers.original_host, "api.divine.video");
         assert_eq!(headers.forwarded_host, "api.divine.video");
         assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_passthrough_headers_preserve_original_api_host_for_mobile_backend() {
+        let headers = passthrough_headers(MOBILE_API_BACKEND, "api.divine.video", "https");
+
+        assert_eq!(headers.backend_host, MOBILE_API_BACKEND_HOST);
+        assert_eq!(headers.original_host, "api.divine.video");
+        assert_eq!(headers.forwarded_host, "api.divine.video");
+        assert_eq!(headers.forwarded_proto, "https");
+    }
+
+    #[test]
+    fn test_apply_passthrough_headers_overwrites_spoofed_original_host() {
+        let mut req = http::Request::builder()
+            .uri("https://api.divine.video/api/videos")
+            .header(header::HOST, "api.divine.video")
+            .header("X-Original-Host", "spoofed.example")
+            .header("X-Original-Host", "another-spoofed.example")
+            .body(())
+            .unwrap();
+        let incoming_host = req
+            .headers()
+            .get(header::HOST)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let headers = passthrough_headers(FUNNELCAKE_API_BACKEND, &incoming_host, "https");
+
+        apply_passthrough_headers(&mut req, headers);
+
+        let original_hosts: Vec<_> = req
+            .headers()
+            .get_all("X-Original-Host")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(original_hosts, vec!["api.divine.video"]);
+        assert_eq!(
+            req.headers().get(header::HOST).unwrap(),
+            FUNNELCAKE_BACKEND_HOST
+        );
+        assert_eq!(
+            req.headers().get("X-Forwarded-Host").unwrap(),
+            "api.divine.video"
+        );
+        assert_eq!(req.headers().get("X-Forwarded-Proto").unwrap(), "https");
     }
 
     #[test]

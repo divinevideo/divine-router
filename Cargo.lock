@@ -84,6 +84,7 @@ name = "divine-router"
 version = "0.1.0"
 dependencies = [
  "fastly",
+ "http",
  "serde",
  "serde_json",
  "time",

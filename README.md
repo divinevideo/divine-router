@@ -48,8 +48,9 @@ Reserved single-level subdomains are routed by name:
 | --- | --- |
 | `media`, `blossom` | Blossom / media server |
 | `invite` | Invite faucet service |
-| `api` | Funnelcake API (`relay.divine.video`) |
-| `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `stream`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
+| `api` | Funnelcake API; on `api.divine.video` only, the exact mobile API routes and sound library paths below use the mobile API and sound proxy backends |
+| `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
+| `stream` | Retired. Router returns `410 Gone` and does not passthrough. |
 
 ### Username subdomains (`alice.divine.video`, `alice.dvines.org`)
 
@@ -92,8 +93,12 @@ on Fastly Compute. It reads the request `Host` and path, classifies the host, an
 then either builds a response in-process (WebFinger, NIP-05, ATProto DID, 404s) or
 rewrites headers and forwards to a backend.
 
-On passthrough it sets `Host` to the backend's expected hostname and adds
-`X-Forwarded-Host` and `X-Forwarded-Proto`. Caching is decided per request:
+On passthrough it sets `Host` to the backend's expected hostname and overwrites
+`X-Original-Host`, `X-Forwarded-Host`, and `X-Forwarded-Proto` with values derived
+at the edge. `X-Original-Host` preserves the public hostname across downstream
+proxy rewrites for exact-URL authentication such as NIP-98; overwriting it on
+every backend prevents a client-supplied value from reaching trusted consumers.
+Caching is decided per request:
 
 - `/.well-known/*` and ActivityPub paths on public Divine hosts, plus WebSocket
   upgrades, are passed uncached.
@@ -139,7 +144,32 @@ Backends are declared in `fastly.toml` for both the local server and Fastly setu
 | `blossom` | Blossom media server |
 | `invite_service` | Invite faucet |
 | `funnelcake_api` | API origin (`relay.divine.video`) |
+| `mobile_api` | Mobile-facing moderation and support identity API |
+| `sound_proxy` | Sound library API (`sounds.divine.video`, a Cloudflare Worker) |
 | `activitypub_gateway` | ActivityPub gateway worker |
+
+On `api.divine.video`, the router sends only these public client contracts to
+`mobile_api`; all other API traffic stays on Funnelcake:
+
+- `GET /v1/account/moderation-status`
+- `POST /v1/minor-review-cases/{caseId}/parent-contact`
+- `POST /api/zendesk/pre-auth`
+
+Their `OPTIONS` preflights follow the same route; wrong methods and every other
+path stay on Funnelcake.
+
+Also on `api.divine.video` only, these sound library paths go to `sound_proxy`:
+
+- `GET /api/sounds/providers`
+- `GET /api/sounds/search`
+- `GET /api/sounds/trending`
+- `GET /api/sounds/{soundEventId}/videos`
+
+The rest of the `/api/sounds` namespace stays on Funnelcake — notably
+`/api/sounds` itself, which is a live Funnelcake endpoint *and* the upstream the
+proxy's own trending handler fetches, and `/api/sounds/{id}/stats`. Both
+per-path lists are scoped by the canonical-host check in `api_backend_for`, so
+`api.dvines.org` continues to route to Funnelcake in full.
 
 Username records are read from KV under the key `user:<username>` with this shape:
 
@@ -163,6 +193,13 @@ Deploy with the Fastly CLI:
 ```bash
 fastly compute publish --non-interactive && fastly purge --all
 ```
+
+`[setup.backends]` bootstraps new Fastly services but is not applied to this
+already-associated service. Before deploying a package that first references a
+new static backend, add that backend to the editable service version and verify
+its address, host override, certificate hostname, and SNI hostname all target
+the intended origin. Never activate code that names a backend absent from the
+same service version.
 
 Because username, WebFinger, and ATProto responses come from KV, publish this service
 after the handle and ATProto state have been written by `divine-name-server`.
