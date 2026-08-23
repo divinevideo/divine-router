@@ -14,6 +14,7 @@ const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const MOBILE_API_BACKEND: &str = "mobile_api";
+const SOUND_PROXY_BACKEND: &str = "sound_proxy";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
 const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_API_HOST: &str = "api.divine.video";
@@ -58,10 +59,17 @@ fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
         || (method == "OPTIONS" && is_mobile_api_path);
 
     if is_supported_request {
-        MOBILE_API_BACKEND
-    } else {
-        FUNNELCAKE_API_BACKEND
+        return MOBILE_API_BACKEND;
     }
+
+    // Reached only for api.divine.video: the canonical-host gate above sends
+    // api.dvines.org to Funnelcake whole, so the sound cutover is scoped to one
+    // domain without a second host check.
+    if is_sound_proxy_path(path) {
+        return SOUND_PROXY_BACKEND;
+    }
+
+    FUNNELCAKE_API_BACKEND
 }
 
 // Subdomains that route to blossom/media server
@@ -249,6 +257,7 @@ const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
 const MOBILE_API_BACKEND_HOST: &str = "api-relay-prod.divine.video";
+const SOUND_PROXY_BACKEND_HOST: &str = "sounds.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,9 +275,32 @@ fn backend_host_for(backend: &str) -> &'static str {
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
         MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
+        SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
+}
+
+// Sound library endpoints implemented by divine-sound-proxy under the
+// /api/sounds namespace. The rest of the namespace stays on Funnelcake —
+// notably /api/sounds itself, which is a live Funnelcake endpoint AND the
+// upstream the proxy's own /api/sounds/trending handler fetches.
+const SOUND_PROXY_API_PATHS: &[&str] = &[
+    "/api/sounds/providers",
+    "/api/sounds/search",
+    "/api/sounds/trending",
+];
+
+/// Matches `/api/sounds/{sound_event_id}/videos` only, so sibling endpoints
+/// such as `/api/sounds/{id}/stats` keep routing to Funnelcake.
+fn is_sound_proxy_videos_path(path: &str) -> bool {
+    path.strip_prefix("/api/sounds/")
+        .and_then(|rest| rest.strip_suffix("/videos"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn is_sound_proxy_path(path: &str) -> bool {
+    SOUND_PROXY_API_PATHS.contains(&path) || is_sound_proxy_videos_path(path)
 }
 
 fn passthrough_headers<'a>(
@@ -1362,6 +1394,8 @@ mod tests {
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
             MOBILE_API_BACKEND,
+            SOUND_PROXY_BACKEND,
+            ACTIVITYPUB_BACKEND,
         ] {
             let local_backend = format!("[local_server.backends.{backend}]");
             let setup_backend = format!("[setup.backends.{backend}]");
@@ -1487,6 +1521,87 @@ mod tests {
 
         assert!(policy.cacheable);
         assert_eq!(policy.fallback_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn test_sound_proxy_endpoints_route_to_sound_proxy_backend() {
+        for path in [
+            "/api/sounds/providers",
+            "/api/sounds/search",
+            "/api/sounds/trending",
+            "/api/sounds/evt123/videos",
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, "GET", path),
+                SOUND_PROXY_BACKEND,
+                "{path} should route to the sound proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sound_proxy_cutover_is_scoped_to_the_canonical_api_host() {
+        // classify_host maps `api` on either owned apex to System("api"), so
+        // without the canonical-host gate in api_backend_for this cutover would
+        // silently divert api.dvines.org too. That domain serves today and is
+        // not part of this change.
+        for path in [
+            "/api/sounds/providers",
+            "/api/sounds/search",
+            "/api/sounds/trending",
+            "/api/sounds/evt123/videos",
+        ] {
+            assert_eq!(
+                api_backend_for("api.dvines.org", "GET", path),
+                FUNNELCAKE_API_BACKEND,
+                "{path} on api.dvines.org must stay on Funnelcake"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unimplemented_sound_paths_stay_on_funnelcake_backend() {
+        // /api/sounds is a live Funnelcake endpoint and the upstream for the
+        // proxy's own trending handler; the proxy 404s it.
+        for path in [
+            "/api/sounds",
+            "/api/sounds/",
+            "/api/sounds/evt123",
+            "/api/sounds/evt123/stats",
+            "/api/sounds/evt123/videos/extra",
+            "/api/sounds//videos",
+            "/api/sounds/providers/",
+            "/api/sounds/providers/extra",
+            "/api/sounds/searching",
+            "/api/sounds/trending/weekly",
+        ] {
+            assert_eq!(
+                api_backend_for(CANONICAL_API_HOST, "GET", path),
+                FUNNELCAKE_API_BACKEND,
+                "{path} is not implemented by the sound proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_api_non_sound_paths_still_route_to_funnelcake_backend() {
+        assert_eq!(
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/search"),
+            FUNNELCAKE_API_BACKEND
+        );
+        assert_eq!(
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/events"),
+            FUNNELCAKE_API_BACKEND
+        );
+        assert_eq!(
+            api_backend_for(CANONICAL_API_HOST, "GET", "/api/sounds-v2"),
+            FUNNELCAKE_API_BACKEND
+        );
+    }
+
+    #[test]
+    fn test_sound_proxy_backend_host_matches_deployed_worker_route() {
+        assert_eq!(backend_host_for(SOUND_PROXY_BACKEND), "sounds.divine.video");
     }
 
     #[test]
