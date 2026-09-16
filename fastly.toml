@@ -30,6 +30,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.mobile_api]
       url = "https://api-relay-prod.divine.video"
 
+    [local_server.backends.sound_proxy]
+      url = "https://sounds.divine.video"
+
     [local_server.backends.activitypub_gateway]
       url = "https://divine-activity-pub.protestnet.workers.dev"
 
@@ -68,6 +71,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.mobile_api]
       address = "api-relay-prod.divine.video"
+      port = 443
+
+    [setup.backends.sound_proxy]
+      address = "sounds.divine.video"
       port = 443
 
     [setup.backends.activitypub_gateway]
