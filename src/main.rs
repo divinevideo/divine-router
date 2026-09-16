@@ -64,8 +64,10 @@ fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
 
     // Reached only for api.divine.video: the canonical-host gate above sends
     // api.dvines.org to Funnelcake whole, so the sound cutover is scoped to one
-    // domain without a second host check.
-    if is_sound_proxy_path(path) {
+    // domain without a second host check. Only GET is documented on these paths,
+    // and OPTIONS has to reach the proxy so its preflight answer is what a
+    // browser sees; every other method stays on Funnelcake.
+    if is_sound_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
         return SOUND_PROXY_BACKEND;
     }
 
@@ -1535,6 +1537,74 @@ mod tests {
                 api_backend_for(CANONICAL_API_HOST, "GET", path),
                 SOUND_PROXY_BACKEND,
                 "{path} should route to the sound proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sound_proxy_cutover_is_limited_to_get_and_options() {
+        // README documents these as GET. OPTIONS must reach the proxy so its
+        // preflight answer is what browsers see; every other method belongs to
+        // Funnelcake, matching the method-gated mobile API block above.
+        for method in ["GET", "OPTIONS"] {
+            for path in [
+                "/api/sounds/providers",
+                "/api/sounds/search",
+                "/api/sounds/trending",
+                "/api/sounds/evt123/videos",
+            ] {
+                assert_eq!(
+                    api_backend_for(CANONICAL_API_HOST, method, path),
+                    SOUND_PROXY_BACKEND,
+                    "{method} {path} should reach the sound proxy"
+                );
+            }
+        }
+
+        for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD"] {
+            for path in [
+                "/api/sounds/providers",
+                "/api/sounds/search",
+                "/api/sounds/trending",
+                "/api/sounds/evt123/videos",
+            ] {
+                assert_eq!(
+                    api_backend_for(CANONICAL_API_HOST, method, path),
+                    FUNNELCAKE_API_BACKEND,
+                    "{method} {path} is not part of the cutover"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sound_proxy_paths_use_the_api_cache_policy() {
+        // sound_proxy is a non-Funnelcake origin under api.divine.video, so it
+        // inherits the API cache policy rather than the mobile_api explicit
+        // pass. That includes EDGE_STALE_IF_ERROR_SECS. Whether a
+        // Cloudflare-fronted origin should share Funnelcake's 24h stale-if-error
+        // contract is still an open platform-owner decision in review; this test
+        // pins today's behavior so any change to it is deliberate.
+        for path in [
+            "/api/sounds/providers",
+            "/api/sounds/search",
+            "/api/sounds/trending",
+            "/api/sounds/evt123/videos",
+        ] {
+            assert_eq!(
+                passthrough_cache_mode(
+                    CANONICAL_API_HOST,
+                    "GET",
+                    path,
+                    false,
+                    false,
+                    SOUND_PROXY_BACKEND,
+                ),
+                PassthroughCacheMode::Cacheable {
+                    fallback_ttl_secs: Some(30),
+                    honors_origin_stale_if_error: true,
+                },
+                "{path} should inherit the API cache policy"
             );
         }
     }
