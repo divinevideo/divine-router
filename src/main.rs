@@ -287,11 +287,7 @@ fn backend_host_for(backend: &str) -> &'static str {
 // /api/sounds namespace. The rest of the namespace stays on Funnelcake —
 // notably /api/sounds itself, which is a live Funnelcake endpoint AND the
 // upstream the proxy's own /api/sounds/trending handler fetches.
-const SOUND_PROXY_API_PATHS: &[&str] = &[
-    "/api/sounds/providers",
-    "/api/sounds/search",
-    "/api/sounds/trending",
-];
+const SOUND_PROXY_API_PATHS: &[&str] = &["/api/sounds/providers", "/api/sounds/trending"];
 
 /// Matches `/api/sounds/{sound_event_id}/videos` only, so sibling endpoints
 /// such as `/api/sounds/{id}/stats` keep routing to Funnelcake.
@@ -482,7 +478,7 @@ fn passthrough_cache_mode(
 
     let is_api_host =
         matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
-    if backend == MOBILE_API_BACKEND {
+    if matches!(backend, MOBILE_API_BACKEND | SOUND_PROXY_BACKEND) {
         return PassthroughCacheMode::Pass;
     }
 
@@ -1529,7 +1525,6 @@ mod tests {
     fn test_sound_proxy_endpoints_route_to_sound_proxy_backend() {
         for path in [
             "/api/sounds/providers",
-            "/api/sounds/search",
             "/api/sounds/trending",
             "/api/sounds/evt123/videos",
         ] {
@@ -1549,7 +1544,6 @@ mod tests {
         for method in ["GET", "OPTIONS"] {
             for path in [
                 "/api/sounds/providers",
-                "/api/sounds/search",
                 "/api/sounds/trending",
                 "/api/sounds/evt123/videos",
             ] {
@@ -1564,7 +1558,6 @@ mod tests {
         for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD"] {
             for path in [
                 "/api/sounds/providers",
-                "/api/sounds/search",
                 "/api/sounds/trending",
                 "/api/sounds/evt123/videos",
             ] {
@@ -1578,16 +1571,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sound_proxy_paths_use_the_api_cache_policy() {
-        // sound_proxy is a non-Funnelcake origin under api.divine.video, so it
-        // inherits the API cache policy rather than the mobile_api explicit
-        // pass. That includes EDGE_STALE_IF_ERROR_SECS. Whether a
-        // Cloudflare-fronted origin should share Funnelcake's 24h stale-if-error
-        // contract is still an open platform-owner decision in review; this test
-        // pins today's behavior so any change to it is deliberate.
+    fn test_sound_proxy_paths_bypass_fastly_cache() {
+        // sounds.divine.video is already cached by Cloudflare according to the
+        // origin's Cache-Control headers. Do not layer Fastly's API cache or
+        // 24-hour stale-if-error window on top of that contract.
         for path in [
             "/api/sounds/providers",
-            "/api/sounds/search",
             "/api/sounds/trending",
             "/api/sounds/evt123/videos",
         ] {
@@ -1600,11 +1589,8 @@ mod tests {
                     false,
                     SOUND_PROXY_BACKEND,
                 ),
-                PassthroughCacheMode::Cacheable {
-                    fallback_ttl_secs: Some(30),
-                    honors_origin_stale_if_error: true,
-                },
-                "{path} should inherit the API cache policy"
+                PassthroughCacheMode::Pass,
+                "{path} should rely on the origin cache policy"
             );
         }
     }
@@ -1617,7 +1603,6 @@ mod tests {
         // not part of this change.
         for path in [
             "/api/sounds/providers",
-            "/api/sounds/search",
             "/api/sounds/trending",
             "/api/sounds/evt123/videos",
         ] {
@@ -1642,6 +1627,7 @@ mod tests {
             "/api/sounds//videos",
             "/api/sounds/providers/",
             "/api/sounds/providers/extra",
+            "/api/sounds/search",
             "/api/sounds/searching",
             "/api/sounds/trending/weekly",
         ] {

@@ -161,7 +161,6 @@ path stay on Funnelcake.
 Also on `api.divine.video` only, these sound library paths go to `sound_proxy`:
 
 - `GET /api/sounds/providers`
-- `GET /api/sounds/search`
 - `GET /api/sounds/trending`
 - `GET /api/sounds/{soundEventId}/videos`
 
@@ -170,6 +169,14 @@ The rest of the `/api/sounds` namespace stays on Funnelcake — notably
 proxy's own trending handler fetches, and `/api/sounds/{id}/stats`. Both
 per-path lists are scoped by the canonical-host check in `api_backend_for`, so
 `api.dvines.org` continues to route to Funnelcake in full.
+
+`/api/sounds/search` also remains on Funnelcake until the sound proxy's search
+provider credential is configured; widening the allowlist after that is a
+separate, observable cutover.
+
+Sound proxy responses bypass Fastly caching and rely on the Cloudflare origin's
+own `Cache-Control` policy. This avoids layering the router's 24-hour
+stale-if-error window over a separately cached origin.
 
 Username records are read from KV under the key `user:<username>` with this shape:
 
