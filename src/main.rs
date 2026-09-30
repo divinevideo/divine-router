@@ -40,20 +40,20 @@ fn is_activitypub_path(path: &str) -> bool {
         || path.starts_with("/nodeinfo/")
 }
 
+fn is_minor_review_case_action_path(path: &str, action: &str) -> bool {
+    path.strip_prefix("/v1/minor-review-cases/")
+        .and_then(|remainder| remainder.strip_suffix(action))
+        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'))
+}
+
 fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
     let hostname = host.split(':').next().unwrap_or(host);
     if !hostname.eq_ignore_ascii_case(CANONICAL_API_HOST) {
         return FUNNELCAKE_API_BACKEND;
     }
 
-    let is_parent_contact_path = path
-        .strip_prefix("/v1/minor-review-cases/")
-        .and_then(|remainder| remainder.strip_suffix("/parent-contact"))
-        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
-    let is_parent_consent_path = path
-        .strip_prefix("/v1/minor-review-cases/")
-        .and_then(|remainder| remainder.strip_suffix("/parent-consent"))
-        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
+    let is_parent_contact_path = is_minor_review_case_action_path(path, "/parent-contact");
+    let is_parent_consent_path = is_minor_review_case_action_path(path, "/parent-consent");
     let is_mobile_api_path = path == "/v1/account/moderation-status"
         || is_parent_contact_path
         || is_parent_consent_path
