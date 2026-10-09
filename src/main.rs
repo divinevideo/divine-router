@@ -40,21 +40,26 @@ fn is_activitypub_path(path: &str) -> bool {
         || path.starts_with("/nodeinfo/")
 }
 
+fn is_minor_review_case_action_path(path: &str, action: &str) -> bool {
+    path.strip_prefix("/v1/minor-review-cases/")
+        .and_then(|remainder| remainder.strip_suffix(action))
+        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'))
+}
+
 fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
     let hostname = host.split(':').next().unwrap_or(host);
     if !hostname.eq_ignore_ascii_case(CANONICAL_API_HOST) {
         return FUNNELCAKE_API_BACKEND;
     }
 
-    let is_parent_contact_path = path
-        .strip_prefix("/v1/minor-review-cases/")
-        .and_then(|remainder| remainder.strip_suffix("/parent-contact"))
-        .is_some_and(|case_id| !case_id.is_empty() && !case_id.contains('/'));
+    let is_parent_contact_path = is_minor_review_case_action_path(path, "/parent-contact");
+    let is_parent_consent_path = is_minor_review_case_action_path(path, "/parent-consent");
     let is_mobile_api_path = path == "/v1/account/moderation-status"
         || is_parent_contact_path
+        || is_parent_consent_path
         || path == "/api/zendesk/pre-auth";
     let is_supported_request = (method == "GET" && path == "/v1/account/moderation-status")
-        || (method == "POST" && is_parent_contact_path)
+        || (method == "POST" && (is_parent_contact_path || is_parent_consent_path))
         || (method == "POST" && path == "/api/zendesk/pre-auth")
         || (method == "OPTIONS" && is_mobile_api_path);
 
@@ -1414,9 +1419,11 @@ mod tests {
         for (method, path) in [
             ("GET", "/v1/account/moderation-status"),
             ("POST", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("POST", "/v1/minor-review-cases/case-123/parent-consent"),
             ("POST", "/api/zendesk/pre-auth"),
             ("OPTIONS", "/v1/account/moderation-status"),
             ("OPTIONS", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("OPTIONS", "/v1/minor-review-cases/case-123/parent-consent"),
             ("OPTIONS", "/api/zendesk/pre-auth"),
         ] {
             assert_eq!(
@@ -1431,6 +1438,9 @@ mod tests {
         for (method, path) in [
             ("POST", "/v1/account/moderation-status"),
             ("GET", "/v1/minor-review-cases/case-123/parent-contact"),
+            ("GET", "/v1/minor-review-cases/case-123/parent-consent"),
+            ("POST", "/v1/minor-review-cases//parent-consent"),
+            ("POST", "/v1/minor-review-cases/case/extra/parent-consent"),
             ("POST", "/v1/minor-review-cases//parent-contact"),
             ("POST", "/v1/minor-review-cases/case/extra/parent-contact"),
             ("GET", "/api/zendesk/pre-auth"),

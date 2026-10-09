@@ -153,6 +153,7 @@ On `api.divine.video`, the router sends only these public client contracts to
 
 - `GET /v1/account/moderation-status`
 - `POST /v1/minor-review-cases/{caseId}/parent-contact`
+- `POST /v1/minor-review-cases/{caseId}/parent-consent`
 - `POST /api/zendesk/pre-auth`
 
 Their `OPTIONS` preflights follow the same route; wrong methods and every other
