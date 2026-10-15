@@ -52,14 +52,17 @@ fn api_backend_for(host: &str, method: &str, path: &str) -> &'static str {
         return FUNNELCAKE_API_BACKEND;
     }
 
+    let is_greenlight_start_path = path == "/v1/minor-review-cases/greenlight";
     let is_parent_contact_path = is_minor_review_case_action_path(path, "/parent-contact");
     let is_parent_consent_path = is_minor_review_case_action_path(path, "/parent-consent");
     let is_mobile_api_path = path == "/v1/account/moderation-status"
+        || is_greenlight_start_path
         || is_parent_contact_path
         || is_parent_consent_path
         || path == "/api/zendesk/pre-auth";
     let is_supported_request = (method == "GET" && path == "/v1/account/moderation-status")
-        || (method == "POST" && (is_parent_contact_path || is_parent_consent_path))
+        || (method == "POST"
+            && (is_greenlight_start_path || is_parent_contact_path || is_parent_consent_path))
         || (method == "POST" && path == "/api/zendesk/pre-auth")
         || (method == "OPTIONS" && is_mobile_api_path);
 
@@ -1418,9 +1421,11 @@ mod tests {
     fn test_api_backend_routes_only_mobile_moderation_contract_to_worker() {
         for (method, path) in [
             ("GET", "/v1/account/moderation-status"),
+            ("POST", "/v1/minor-review-cases/greenlight"),
             ("POST", "/v1/minor-review-cases/case-123/parent-contact"),
             ("POST", "/v1/minor-review-cases/case-123/parent-consent"),
             ("POST", "/api/zendesk/pre-auth"),
+            ("OPTIONS", "/v1/minor-review-cases/greenlight"),
             ("OPTIONS", "/v1/account/moderation-status"),
             ("OPTIONS", "/v1/minor-review-cases/case-123/parent-contact"),
             ("OPTIONS", "/v1/minor-review-cases/case-123/parent-consent"),
@@ -1436,6 +1441,8 @@ mod tests {
     #[test]
     fn test_api_backend_keeps_unrelated_and_wrong_method_requests_on_funnelcake() {
         for (method, path) in [
+            ("GET", "/v1/minor-review-cases/greenlight"),
+            ("POST", "/v1/minor-review-cases/greenlight/extra"),
             ("POST", "/v1/account/moderation-status"),
             ("GET", "/v1/minor-review-cases/case-123/parent-contact"),
             ("GET", "/v1/minor-review-cases/case-123/parent-consent"),
