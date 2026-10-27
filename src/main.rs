@@ -16,6 +16,8 @@ const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
 const MOBILE_API_BACKEND: &str = "mobile_api";
 const SOUND_PROXY_BACKEND: &str = "sound_proxy";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
+const SHORTENER_BACKEND: &str = "link_shortener";
+const SHORTENER_BACKEND_HOST: &str = "vaguely-robust-ant.edgecompute.app";
 const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
@@ -138,6 +140,10 @@ fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
 
+    if is_short_link_route(&host, &path) {
+        return passthrough(req, SHORTENER_BACKEND, &host);
+    }
+
     // ActivityPub on the divine.video / dvines.org apex:
     //  - /.well-known/webfinger -> served HERE from the username KV (proper 404s).
     //  - /ap/* and /nodeinfo     -> diverted to the divine-activity-pub worker.
@@ -184,6 +190,16 @@ fn main(req: Request) -> Result<Response, Error> {
             handle_username_request(&username, &path, req)
         }
     }
+}
+
+fn is_short_link_route(host: &str, path: &str) -> bool {
+    let hostname = host.split(':').next().unwrap_or(host);
+    (hostname.eq_ignore_ascii_case("divine.video")
+        || hostname.eq_ignore_ascii_case("www.divine.video"))
+        && (path == "/l"
+            || path.starts_with("/l/")
+            || path == "/api/links"
+            || path.starts_with("/api/links/"))
 }
 
 #[derive(Debug, PartialEq)]
@@ -284,6 +300,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
         SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
+        SHORTENER_BACKEND => SHORTENER_BACKEND_HOST,
         _ => MAIN_BACKEND_HOST,
     }
 }
@@ -483,7 +500,10 @@ fn passthrough_cache_mode(
 
     let is_api_host =
         matches!(classify_host(host), HostType::System(ref subdomain) if subdomain == "api");
-    if matches!(backend, MOBILE_API_BACKEND | SOUND_PROXY_BACKEND) {
+    if matches!(
+        backend,
+        MOBILE_API_BACKEND | SOUND_PROXY_BACKEND | SHORTENER_BACKEND
+    ) {
         return PassthroughCacheMode::Pass;
     }
 
@@ -977,6 +997,67 @@ fn bech32_checksum(hrp_expand: &[u8], data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_links_match_only_public_hosts_and_exact_namespaces() {
+        for host in [
+            "divine.video",
+            "www.divine.video",
+            "DIVINE.VIDEO",
+            "divine.video:443",
+        ] {
+            for path in ["/l", "/l/Abc12345", "/api/links", "/api/links/Abc12345"] {
+                assert!(is_short_link_route(host, path), "{host} {path}");
+            }
+            for path in [
+                "/login",
+                "/lists",
+                "/l-other",
+                "/api/linkstuff",
+                "/video/test",
+                "/.well-known/nostr.json",
+                "/ap/actor",
+            ] {
+                assert!(!is_short_link_route(host, path), "{host} {path}");
+            }
+        }
+        for host in [
+            "api.divine.video",
+            "alice.divine.video",
+            "dvines.org",
+            "example.com",
+            "divine.video.example.com",
+        ] {
+            assert!(!is_short_link_route(host, "/l/Abc12345"), "{host}");
+        }
+    }
+
+    #[test]
+    fn short_link_backend_uses_the_assigned_origin_and_passes_without_cache_hooks() {
+        assert_eq!(
+            backend_host_for("link_shortener"),
+            "vaguely-robust-ant.edgecompute.app"
+        );
+        for method in ["GET", "HEAD", "POST", "OPTIONS"] {
+            for path in ["/l/Abc12345", "/api/links", "/api/links/Abc12345"] {
+                assert_eq!(
+                    passthrough_cache_mode(
+                        "divine.video",
+                        method,
+                        path,
+                        false,
+                        false,
+                        "link_shortener"
+                    ),
+                    PassthroughCacheMode::Pass,
+                );
+            }
+        }
+        let headers = passthrough_headers("link_shortener", "www.divine.video", "https");
+        assert_eq!(headers.backend_host, "vaguely-robust-ant.edgecompute.app");
+        assert_eq!(headers.forwarded_host, "www.divine.video");
+        assert_eq!(headers.forwarded_proto, "https");
+    }
 
     impl PassthroughHeaderTarget for http::Request<()> {
         fn overwrite_header(&mut self, name: &'static str, value: &str) {
