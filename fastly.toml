@@ -36,6 +36,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.activitypub_gateway]
       url = "https://divine-activity-pub.protestnet.workers.dev"
 
+    [local_server.backends.link_shortener]
+      url = "https://vaguely-robust-ant.edgecompute.app"
+
   [local_server.kv_stores]
 
     [local_server.kv_stores.usernames]
@@ -79,6 +82,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.activitypub_gateway]
       address = "divine-activity-pub.protestnet.workers.dev"
+      port = 443
+
+    [setup.backends.link_shortener]
+      address = "vaguely-robust-ant.edgecompute.app"
       port = 443
 
   [setup.kv_stores]
