@@ -10,6 +10,10 @@
 *.wasm
 pkg/
 
+# Deployment helper artifacts
+__pycache__/
+deployment.json
+
 # IDE
 .idea/
 .vscode/

@@ -197,10 +197,22 @@ requires `atproto_state` to be `ready` and `atproto_did` to be present.
 
 ## Deployment
 
-Deploy with the Fastly CLI:
+The [production workflow](.github/workflows/deploy.yml) tests and builds the
+exact `main` commit before deploying it. Deployment is **opt-in**: an authorized
+operator must finish the environment and credential prerequisites in
+[the deployment runbook](docs/deployment.md) before setting `FASTLY_CD_ENABLED`.
+Merging this workflow alone does not enable production writes. PRs never deploy.
+
+For separately authorized manual deployments, use the Fastly CLI:
 
 ```bash
 fastly compute publish --non-interactive && fastly purge --all
+```
+
+Local deployment-script checks (offline; no provider credentials or traffic):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_deploy.py'
 ```
 
 `[setup.backends]` bootstraps new Fastly services but is not applied to this

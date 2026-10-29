@@ -46,7 +46,7 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
       format = "json"
 
 [scripts]
-  build = "cargo build --profile release --target wasm32-wasip1"
+  build = "cargo build --locked --profile release --target wasm32-wasip1"
 
 [setup]
 
