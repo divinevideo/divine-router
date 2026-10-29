@@ -88,8 +88,9 @@ class Deployer:
         if not required.issubset({backend["name"] for backend in active["backends"]}):
             raise DeploymentError("Active version is missing required static backends")
         resources = self.fastly(f"/service/{self.service}/version/{active['number']}/resource")
-        if not any(r["name"] == "usernames" and r["resource_type"] == "kv-store" for r in resources):
-            raise DeploymentError("Active version is missing the usernames KV binding")
+        # Match KV_STORE_NAME in src/main.rs, not the manifest's local usernames alias.
+        if not any(r["name"] == "divine-names" and r["resource_type"] == "kv-store" for r in resources):
+            raise DeploymentError("Active version is missing the runtime KV binding (divine-names)")
         # Probe this service's existing default domain, not a user-controlled URL.
         domains = [d["name"] for d in active["domains"]
                    if re.fullmatch(r"[a-z0-9-]+\.edgecompute\.app", d["name"])]

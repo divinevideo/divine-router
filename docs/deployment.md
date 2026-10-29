@@ -9,10 +9,20 @@ does not provision replacements or move traffic. Inspect backend addresses,
 TLS/SNI and host overrides as well as names: the automated name/binding guards
 are not a substitute for confirming the serving configuration.
 
+The runtime opens the KV link named `divine-names` (`KV_STORE_NAME` in
+`src/main.rs`). The deployment guard requires that link and its `kv-store` type.
+The manifest's `usernames` local/setup alias is not the runtime lookup name;
+its presence alone does not establish that username/NIP-05 reads can work.
+
 Create or reuse the GitHub **production** environment with the repository's
 approved protection rules (including deployment branches restricted to `main`).
 Configure these environment settings through the separately authorized operational
 process, not by committing credentials:
+
+Prepare protections before the workflow first runs: GitHub can create a named
+environment without protections when a job first references it. Until enabled,
+main runs deliberately fail the prerequisites step rather than reporting a
+skipped or successful deployment. No provider credentials are used at that step.
 
 | Setting | Kind | Purpose |
 | --- | --- | --- |

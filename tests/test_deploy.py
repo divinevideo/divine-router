@@ -33,7 +33,7 @@ class Provider:
         self.calls = []
         self.active = {"number": 7, "comment": "previous", "backends": [{"name": "origin"}],
                        "domains": [{"name": "example-service.edgecompute.app"}]}
-        self.resources = [{"name": "usernames", "resource_type": "kv-store"}]
+        self.resources = [{"name": "divine-names", "resource_type": "kv-store"}]
         self.customer = "ExampleAccount"
         self.main = SHA
         self.valid = "ok"
@@ -127,7 +127,9 @@ class DeploymentTests(unittest.TestCase):
         self.assert_no_writes()
 
     def test_account_backends_and_kv_are_required(self):
-        cases = [("customer", "WrongAccount"), ("resources", [])]
+        cases = [("customer", "WrongAccount"), ("resources", []),
+                 ("resources", [{"name": "usernames", "resource_type": "kv-store"}]),
+                 ("resources", [{"name": "divine-names", "resource_type": "secret-store"}])]
         for name, value in cases:
             with self.subTest(name=name):
                 self.provider = Provider()
