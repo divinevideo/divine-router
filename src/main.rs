@@ -13,6 +13,7 @@ const MAIN_BACKEND: &str = "main_site";
 const BLOSSOM_BACKEND: &str = "blossom";
 const INVITE_BACKEND: &str = "invite_service";
 const FUNNELCAKE_API_BACKEND: &str = "funnelcake_api";
+const CANDIDATE_API_BACKEND: &str = "funnelcake_candidate";
 const MOBILE_API_BACKEND: &str = "mobile_api";
 const SOUND_PROXY_BACKEND: &str = "sound_proxy";
 const ACTIVITYPUB_BACKEND: &str = "activitypub_gateway";
@@ -98,6 +99,8 @@ const RETIRED_SYSTEM_SUBDOMAINS: &[&str] = &["stream"];
 const SYSTEM_SUBDOMAINS: &[&str] = &[
     "www",
     "api",
+    "api2",
+    "relay2",
     "cdn",
     "admin",
     "support",
@@ -142,6 +145,10 @@ struct Nip05Response {
 fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
+
+    if is_candidate_host(&host) {
+        return passthrough(req, CANDIDATE_API_BACKEND, &host);
+    }
 
     if is_short_link_route(&host, &path) {
         return passthrough(req, SHORTENER_BACKEND, &host);
@@ -193,6 +200,12 @@ fn main(req: Request) -> Result<Response, Error> {
             handle_username_request(&username, &path, req)
         }
     }
+}
+
+fn is_candidate_host(host: &str) -> bool {
+    let hostname = host.split(':').next().unwrap_or(host);
+    hostname.eq_ignore_ascii_case("api2.divine.video")
+        || hostname.eq_ignore_ascii_case("relay2.divine.video")
 }
 
 fn is_short_link_route(host: &str, path: &str) -> bool {
@@ -282,6 +295,7 @@ const MAIN_BACKEND_HOST: &str = "inherently-ethical-gelding.edgecompute.app";
 const BLOSSOM_BACKEND_HOST: &str = "separately-robust-roughy.edgecompute.app";
 const INVITE_BACKEND_HOST: &str = "adversely-polished-yak.edgecompute.app";
 const FUNNELCAKE_BACKEND_HOST: &str = "relay.divine.video";
+const CANDIDATE_BACKEND_HOST: &str = "relay2.divine.video";
 const MOBILE_API_BACKEND_HOST: &str = "api-relay-prod.divine.video";
 const SOUND_PROXY_BACKEND_HOST: &str = "sounds.divine.video";
 const ACTIVITYPUB_BACKEND_HOST: &str = "divine-activity-pub.protestnet.workers.dev";
@@ -300,6 +314,7 @@ fn backend_host_for(backend: &str) -> &'static str {
         BLOSSOM_BACKEND => BLOSSOM_BACKEND_HOST,
         INVITE_BACKEND => INVITE_BACKEND_HOST,
         FUNNELCAKE_API_BACKEND => FUNNELCAKE_BACKEND_HOST,
+        CANDIDATE_API_BACKEND => CANDIDATE_BACKEND_HOST,
         MOBILE_API_BACKEND => MOBILE_API_BACKEND_HOST,
         SOUND_PROXY_BACKEND => SOUND_PROXY_BACKEND_HOST,
         ACTIVITYPUB_BACKEND => ACTIVITYPUB_BACKEND_HOST,
@@ -497,7 +512,7 @@ fn passthrough_cache_mode(
     is_websocket_upgrade: bool,
     backend: &str,
 ) -> PassthroughCacheMode {
-    if should_bypass_cache(host, path) || is_websocket_upgrade {
+    if is_candidate_host(host) || should_bypass_cache(host, path) || is_websocket_upgrade {
         return PassthroughCacheMode::Pass;
     }
 
@@ -1255,6 +1270,59 @@ mod tests {
     }
 
     #[test]
+    fn candidate_hosts_use_isolated_origin_and_preserve_public_auth_host() {
+        for host in [
+            "api2.divine.video",
+            "relay2.divine.video",
+            "API2.DIVINE.VIDEO:443",
+        ] {
+            assert!(is_candidate_host(host));
+            let headers = passthrough_headers(CANDIDATE_API_BACKEND, host, "https");
+            assert_eq!(headers.backend_host, "relay2.divine.video");
+            assert_eq!(headers.original_host, host);
+            assert_eq!(headers.forwarded_host, host);
+            assert_eq!(
+                passthrough_cache_mode(
+                    host,
+                    "GET",
+                    "/api/videos",
+                    false,
+                    false,
+                    CANDIDATE_API_BACKEND
+                ),
+                PassthroughCacheMode::Pass
+            );
+        }
+        for host in [
+            "api.divine.video",
+            "relay.divine.video",
+            "api2.dvines.org",
+            "api2.divine.video.example.com",
+            "api2.divine.video.",
+            "evilapi2.divine.video",
+            "api2.evildivine.video",
+        ] {
+            assert!(!is_candidate_host(host));
+        }
+        assert_eq!(
+            backend_host_for(FUNNELCAKE_API_BACKEND),
+            "relay.divine.video"
+        );
+    }
+
+    #[test]
+    fn candidate_names_cannot_be_claimed_as_username_routes() {
+        for host in [
+            "api2.divine.video",
+            "relay2.divine.video",
+            "api2.dvines.org",
+            "relay2.dvines.org",
+        ] {
+            assert!(matches!(classify_host(host), HostType::System(_)));
+        }
+    }
+
+    #[test]
     fn test_classify_host_system_subdomain() {
         assert_eq!(
             classify_host("www.divine.video"),
@@ -1480,6 +1548,7 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            CANDIDATE_API_BACKEND,
             MOBILE_API_BACKEND,
             SOUND_PROXY_BACKEND,
             ACTIVITYPUB_BACKEND,

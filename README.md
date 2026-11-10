@@ -48,6 +48,8 @@ Reserved single-level subdomains are routed by name:
 | --- | --- |
 | `media`, `blossom` | Blossom / media server |
 | `invite` | Invite faucet service |
+| `api2` | Isolated candidate Funnelcake via `relay2.divine.video`, uncached |
+| `relay2` | Reserved for the direct candidate WebSocket origin; candidate passthrough if it reaches Fastly |
 | `api` | Funnelcake API; on `api.divine.video` only, the exact mobile API routes and sound library paths below use the mobile API and sound proxy backends |
 | `www`, `cdn`, `admin`, `support`, `relay`, `analytics`, `funnel`, `gateway`, `names`, `login`, `pds`, `feed`, `labeler` | Main site |
 | `stream` | Retired. Router returns `410 Gone` and does not passthrough. |
@@ -144,6 +146,7 @@ Backends are declared in `fastly.toml` for both the local server and Fastly setu
 | `blossom` | Blossom media server |
 | `invite_service` | Invite faucet |
 | `funnelcake_api` | API origin (`relay.divine.video`) |
+| `funnelcake_candidate` | Candidate origin (`relay2.divine.video`); public `api2.divine.video` requests keep their original host for authentication |
 | `mobile_api` | Mobile-facing moderation and support identity API |
 | `sound_proxy` | Sound library API (`sounds.divine.video`, a Cloudflare Worker) |
 | `activitypub_gateway` | ActivityPub gateway worker |
@@ -232,3 +235,17 @@ MIT
 ---
 
 Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
+
+## Candidate API and relay
+
+`api2.divine.video` uses the dedicated `funnelcake_candidate` Fastly backend.
+Configure that backend with the candidate Gateway address, TLS certificate/SNI
+hostname `relay2.divine.video`, and certificate verification enabled. The router
+sets the origin Host to `relay2.divine.video` and preserves the public hostname
+in its trusted forwarding headers. All candidate requests bypass the edge cache
+so validation observes the candidate database and cannot reuse primary results.
+
+DNS for `api2.divine.video` points to Fastly; `relay2.divine.video` points directly
+to the candidate Gateway for WebSocket support. Reserve both names even while DNS
+is changing. The normal API, mobile API, sound proxy and short-link routes retain
+their existing routing rules.
