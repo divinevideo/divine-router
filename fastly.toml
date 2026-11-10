@@ -27,6 +27,9 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
     [local_server.backends.funnelcake_api]
       url = "https://relay.divine.video"
 
+    [local_server.backends.funnelcake_candidate]
+      url = "https://relay2.divine.video"
+
     [local_server.backends.mobile_api]
       url = "https://api-relay-prod.divine.video"
 
@@ -70,6 +73,10 @@ service_id = "76fTayX6mBKa8faLeZ1fet"
 
     [setup.backends.funnelcake_api]
       address = "relay.divine.video"
+      port = 443
+
+    [setup.backends.funnelcake_candidate]
+      address = "relay2.divine.video"
       port = 443
 
     [setup.backends.mobile_api]
