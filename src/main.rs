@@ -1298,6 +1298,9 @@ mod tests {
             "relay.divine.video",
             "api2.dvines.org",
             "api2.divine.video.example.com",
+            "api2.divine.video.",
+            "evilapi2.divine.video",
+            "api2.evildivine.video",
         ] {
             assert!(!is_candidate_host(host));
         }
@@ -1545,6 +1548,7 @@ mod tests {
             BLOSSOM_BACKEND,
             INVITE_BACKEND,
             FUNNELCAKE_API_BACKEND,
+            CANDIDATE_API_BACKEND,
             MOBILE_API_BACKEND,
             SOUND_PROXY_BACKEND,
             ACTIVITYPUB_BACKEND,
