@@ -24,3 +24,6 @@ jobs:
 
       - name: Test
         run: cargo +1.88.0 test --locked
+
+      - name: Test deployment safety guards
+        run: python3 -m unittest discover -s tests -p 'test_deploy.py'

@@ -1,0 +1,77 @@
+name: Fastly production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel an activation in progress. Every replay also checks live main.
+concurrency:
+  group: fastly-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require deployment prerequisites
+        env:
+          ENABLED: ${{ vars.FASTLY_CD_ENABLED }}
+        run: test "$ENABLED" = true
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --target wasm32-wasip1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Fastly tooling
+        uses: fastly/compute-actions/setup@162500dbf0e0478d15a14532388ade114449ff3e
+        with:
+          cli_version: v17.0.0
+          viceroy_version: v0.22.0
+          token: ${{ github.token }}
+
+      - name: Verify Fastly CLI pin
+        run: fastly version | grep -F 'Fastly CLI version v17.0.0 '
+
+      - name: Test deployment safety guards
+        run: python3 -m unittest discover -s tests -p 'test_deploy.py'
+
+      - name: Test Rust
+        run: cargo +1.88.0 test --locked
+
+      - name: Build checked Compute package
+        run: fastly compute build --non-interactive
+
+      - name: Activate and verify checked source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FASTLY_API_TOKEN: ${{ secrets.FASTLY_API_TOKEN }}
+          FASTLY_CD_ENABLED: ${{ vars.FASTLY_CD_ENABLED }}
+          FASTLY_SERVICE_ID: ${{ vars.FASTLY_SERVICE_ID }}
+          FASTLY_CUSTOMER_ID: ${{ vars.FASTLY_CUSTOMER_ID }}
+        run: python3 scripts/deploy.py
+
+      - name: Preserve deployment receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fastly-production-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: deployment.json
+          if-no-files-found: warn
+          retention-days: 90
