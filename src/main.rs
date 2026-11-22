@@ -25,11 +25,13 @@ const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const RETIRED_SYSTEM_BODY: &str = "Gone\n";
+const BLOCKED_SCRAPER_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const BLOCKED_SCRAPER_BODY: &str = "Forbidden\n";
-const BLOCKED_SCRAPER_CACHE_CONTROL: &str = "public, max-age=3600";
+const BLOCKED_SCRAPER_CACHE_CONTROL: &str = "private, no-store";
 
-/// Known AI training and aggressive SEO scraper user-agent tokens blocked at
-/// the edge before reaching divine-web SSR or Funnelcake origin.
+/// Known AI crawlers (training, AI search, and automated AI fetchers) and
+/// aggressive SEO scraper user-agent tokens blocked at the edge before
+/// reaching divine-web SSR or Funnelcake origin.
 ///
 /// Legitimate search engines (`Googlebot`, `Bingbot`, `DuckDuckBot`, `Applebot`
 /// without `-Extended`, `YandexBot`) and social link-preview crawlers
@@ -70,6 +72,9 @@ fn is_blocked_scraper_user_agent(user_agent: &str) -> bool {
 }
 
 fn is_scraper_exempt_path(path: &str) -> bool {
+    if path.contains("..") {
+        return false;
+    }
     path == "/robots.txt" || path.starts_with("/.well-known/") || is_activitypub_path(path)
 }
 
@@ -82,8 +87,9 @@ fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> b
 
 fn blocked_scraper_response() -> Response {
     Response::from_status(StatusCode::FORBIDDEN)
-        .with_header(header::CONTENT_TYPE, RETIRED_SYSTEM_CONTENT_TYPE)
+        .with_header(header::CONTENT_TYPE, BLOCKED_SCRAPER_CONTENT_TYPE)
         .with_header(header::CACHE_CONTROL, BLOCKED_SCRAPER_CACHE_CONTROL)
+        .with_header(header::VARY, "User-Agent")
         .with_body(BLOCKED_SCRAPER_BODY)
 }
 
@@ -2614,5 +2620,31 @@ mod tests {
         assert!(!should_block_scraper("GET", "/ap/users/alice", scraper));
         assert!(!should_block_scraper("GET", "/nodeinfo/2.0", scraper));
         assert!(!should_block_scraper("OPTIONS", "/api/videos", scraper));
+        assert!(!should_block_scraper("options", "/api/videos", scraper));
+        // Dot-segment traversal must not gain path exemption.
+        assert!(should_block_scraper(
+            "GET",
+            "/.well-known/../api/videos/123",
+            scraper
+        ));
+        assert!(should_block_scraper("HEAD", "/api/videos/123", scraper));
+        assert!(should_block_scraper("POST", "/api/videos", scraper));
+        assert!(!should_block_scraper("GET", "/video/abc", Some("")));
+    }
+
+    #[test]
+    fn test_blocked_scraper_tokens_are_lowercase_and_response_is_not_shared_cached() {
+        for token in BLOCKED_SCRAPER_USER_AGENTS {
+            assert_eq!(
+                *token,
+                token.to_ascii_lowercase(),
+                "BLOCKED_SCRAPER_USER_AGENTS token must be lowercase ASCII: {token}"
+            );
+            assert!(
+                is_blocked_scraper_user_agent(token),
+                "token should match itself: {token}"
+            );
+        }
+        assert_eq!(BLOCKED_SCRAPER_CACHE_CONTROL, "private, no-store");
     }
 }
