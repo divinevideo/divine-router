@@ -29,25 +29,25 @@ const BLOCKED_SCRAPER_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const BLOCKED_SCRAPER_BODY: &str = "Forbidden\n";
 const BLOCKED_SCRAPER_CACHE_CONTROL: &str = "private, no-store";
 
-/// Known AI crawlers (training, AI search, and automated AI fetchers) and
-/// aggressive SEO scraper user-agent tokens blocked at the edge before
-/// reaching divine-web SSR or Funnelcake origin.
+/// Known AI training and aggressive SEO scraper user-agent tokens blocked at
+/// the edge before reaching divine-web SSR or Funnelcake origin.
 ///
 /// Legitimate search engines (`Googlebot`, `Bingbot`, `DuckDuckBot`, `Applebot`
 /// without `-Extended`, `YandexBot`) and social link-preview crawlers
 /// (`facebookexternalhit`, `Twitterbot`, `Slackbot`, `Discordbot`, `TelegramBot`,
-/// `WhatsApp`, `Signal`, `LinkedInBot`) are intentionally NOT in this list.
+/// `WhatsApp`, `Signal`, `LinkedInBot`, `Pinterest`, `Pinterestbot`, `ShowYouBot`)
+/// are intentionally NOT in this list.
 const BLOCKED_SCRAPER_USER_AGENTS: &[&str] = &[
     "gptbot",
-    "chatgpt-user",
-    "oai-searchbot",
     "claudebot",
-    "claude-web",
     "anthropic-ai",
     "bytespider",
     "amazonbot",
     "meta-externalagent",
-    "meta-externalfetcher",
+    "facebookbot",
+    "googleother",
+    "googleother-image",
+    "googleother-video",
     "ccbot",
     "petalbot",
     "semrushbot",
@@ -56,19 +56,52 @@ const BLOCKED_SCRAPER_USER_AGENTS: &[&str] = &[
     "dotbot",
     "dataforseobot",
     "blexbot",
-    "perplexitybot",
     "diffbot",
     "applebot-extended",
     "scrapy",
     "imagesiftbot",
     "youbot",
+    "cohere-ai",
+    "cohere-training-data-crawler",
+    "ai2bot",
+    "ai2bot-dolma",
+    "timpibot",
+    "omgilibot",
+    "webzio-extended",
+    "deepseekbot",
+    "pangubot",
 ];
 
+/// AI assistant and search fetchers allowed to read the static `/llms.txt`
+/// guide (`GET`/`HEAD`) while remaining blocked from crawling the catalog and
+/// API, matching `divine-web/public/robots.txt`.
+const ASSISTANT_GUIDE_ONLY_USER_AGENTS: &[&str] = &[
+    "chatgpt-user",
+    "oai-searchbot",
+    "claude-web",
+    "claude-user",
+    "claude-searchbot",
+    "meta-externalfetcher",
+    "perplexitybot",
+];
+
+fn user_agent_matches_any_token(user_agent: &str, tokens: &[&str]) -> bool {
+    user_agent
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            tokens
+                .iter()
+                .any(|token| segment.eq_ignore_ascii_case(token))
+        })
+}
+
 fn is_blocked_scraper_user_agent(user_agent: &str) -> bool {
-    let lower = user_agent.to_ascii_lowercase();
-    BLOCKED_SCRAPER_USER_AGENTS
-        .iter()
-        .any(|token| lower.contains(token))
+    user_agent_matches_any_token(user_agent, BLOCKED_SCRAPER_USER_AGENTS)
+}
+
+fn is_assistant_guide_only_user_agent(user_agent: &str) -> bool {
+    user_agent_matches_any_token(user_agent, ASSISTANT_GUIDE_ONLY_USER_AGENTS)
 }
 
 fn is_scraper_exempt_path(path: &str) -> bool {
@@ -78,11 +111,25 @@ fn is_scraper_exempt_path(path: &str) -> bool {
     path == "/robots.txt" || path.starts_with("/.well-known/") || is_activitypub_path(path)
 }
 
+fn is_assistant_guide_request(method: &str, path: &str) -> bool {
+    path == "/llms.txt"
+        && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+}
+
 fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> bool {
     if method.eq_ignore_ascii_case("OPTIONS") || is_scraper_exempt_path(path) {
         return false;
     }
-    user_agent.is_some_and(is_blocked_scraper_user_agent)
+    let Some(ua) = user_agent else {
+        return false;
+    };
+    if is_blocked_scraper_user_agent(ua) {
+        return true;
+    }
+    if is_assistant_guide_only_user_agent(ua) {
+        return !is_assistant_guide_request(method, path);
+    }
+    false
 }
 
 fn blocked_scraper_response() -> Response {
@@ -2563,10 +2610,24 @@ mod tests {
             "Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)",
             "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
             "meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)",
+            "FacebookBot",
+            "Mozilla/5.0 (compatible; GoogleOther)",
+            "GoogleOther-Image/1.0",
+            "GoogleOther-Video/1.0",
             "CCBot/2.0 (https://commoncrawl.org/faq/)",
             "Mozilla/5.0 (compatible; PetalBot;+https://webmaster.petalsearch.com/site/petalbot)",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Applebot-Extended",
             "Scrapy/2.11.0 (+https://scrapy.org)",
+            "Mozilla/5.0 (compatible; YouBot/1.0; +https://about.you.com/youbot/)",
+            "cohere-ai",
+            "cohere-training-data-crawler",
+            "Mozilla/5.0 (compatible; AI2Bot/1.0; +https://allenai.org/crawler)",
+            "Ai2Bot-Dolma/1.0",
+            "Timpibot/0.8 (+http://www.timpi.io)",
+            "Omgilibot/0.4 +http://omgili.com",
+            "Webzio-Extended/1.0",
+            "DeepSeekBot/1.0",
+            "PanguBot/1.0",
         ] {
             assert!(
                 should_block_scraper("GET", "/t/halo3", Some(ua)),
@@ -2575,6 +2636,52 @@ mod tests {
             assert!(
                 should_block_scraper("GET", "/api/videos/123", Some(ua)),
                 "expected scraper UA to be blocked on API: {ua}"
+            );
+            assert!(
+                should_block_scraper("GET", "/llms.txt", Some(ua)),
+                "expected training/SEO scraper UA to be blocked on /llms.txt: {ua}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assistant_guide_only_bots_can_fetch_llms_txt_only() {
+        for ua in [
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ChatGPT-User/1.0)",
+            "OAI-SearchBot/1.0 (+https://openai.com/searchbot)",
+            "Claude-Web/1.0",
+            "Claude-User/1.0 (+Claude-User@anthropic.com)",
+            "Claude-SearchBot/1.0 (+Claude-SearchBot@anthropic.com)",
+            "meta-externalfetcher/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)",
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0)",
+        ] {
+            assert!(
+                !should_block_scraper("GET", "/llms.txt", Some(ua)),
+                "expected assistant UA to be allowed on GET /llms.txt: {ua}"
+            );
+            assert!(
+                !should_block_scraper("HEAD", "/llms.txt", Some(ua)),
+                "expected assistant UA to be allowed on HEAD /llms.txt: {ua}"
+            );
+            assert!(
+                !should_block_scraper("GET", "/robots.txt", Some(ua)),
+                "expected assistant UA to be allowed on /robots.txt: {ua}"
+            );
+            assert!(
+                should_block_scraper("POST", "/llms.txt", Some(ua)),
+                "expected assistant UA to be blocked on POST /llms.txt: {ua}"
+            );
+            assert!(
+                should_block_scraper("GET", "/llms.txt/../api/videos", Some(ua)),
+                "expected traversal out of /llms.txt to be blocked: {ua}"
+            );
+            assert!(
+                should_block_scraper("GET", "/video/abc", Some(ua)),
+                "expected assistant UA to be blocked on catalog route: {ua}"
+            );
+            assert!(
+                should_block_scraper("GET", "/api/videos/123", Some(ua)),
+                "expected assistant UA to be blocked on API route: {ua}"
             );
         }
     }
@@ -2592,6 +2699,9 @@ mod tests {
             "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
             "TelegramBot (like TwitterBot)",
             "WhatsApp/2.23.20.0",
+            "Pinterest/0.2 (+https://www.pinterest.com/bot.html)",
+            "Mozilla/5.0 (compatible; Pinterestbot/1.0; +https://www.pinterest.com/bot.html)",
+            "ShowYouBot (http://showyou.com/crawler)",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15",
             "Dart/3.5 (dart:io)",
         ] {
@@ -2639,6 +2749,7 @@ mod tests {
 
     #[test]
     fn test_blocked_scraper_tokens_are_lowercase_and_response_is_not_shared_cached() {
+        let mut seen = HashSet::new();
         for token in BLOCKED_SCRAPER_USER_AGENTS {
             assert_eq!(
                 *token,
@@ -2646,8 +2757,35 @@ mod tests {
                 "BLOCKED_SCRAPER_USER_AGENTS token must be lowercase ASCII: {token}"
             );
             assert!(
+                seen.insert(*token),
+                "duplicate crawler token across lists: {token}"
+            );
+            assert!(
                 is_blocked_scraper_user_agent(token),
                 "token should match itself: {token}"
+            );
+            assert!(
+                !is_assistant_guide_only_user_agent(token),
+                "blocked scraper token must not overlap assistant list: {token}"
+            );
+        }
+        for token in ASSISTANT_GUIDE_ONLY_USER_AGENTS {
+            assert_eq!(
+                *token,
+                token.to_ascii_lowercase(),
+                "ASSISTANT_GUIDE_ONLY_USER_AGENTS token must be lowercase ASCII: {token}"
+            );
+            assert!(
+                seen.insert(*token),
+                "duplicate crawler token across lists: {token}"
+            );
+            assert!(
+                is_assistant_guide_only_user_agent(token),
+                "assistant token should match itself: {token}"
+            );
+            assert!(
+                !is_blocked_scraper_user_agent(token),
+                "assistant token must not overlap blocked scraper list: {token}"
             );
         }
         assert_eq!(BLOCKED_SCRAPER_CACHE_CONTROL, "private, no-store");
