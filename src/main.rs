@@ -72,7 +72,7 @@ fn is_blocked_scraper_user_agent(user_agent: &str) -> bool {
 }
 
 fn is_scraper_exempt_path(path: &str) -> bool {
-    if path.contains("..") {
+    if path.split('/').any(|segment| segment == "..") {
         return false;
     }
     path == "/robots.txt" || path.starts_with("/.well-known/") || is_activitypub_path(path)
@@ -216,7 +216,7 @@ fn main(req: Request) -> Result<Response, Error> {
     if should_block_scraper(
         req.get_method_str(),
         &path,
-        req.get_header_str(header::USER_AGENT),
+        req.get_header_str_lossy(header::USER_AGENT).as_deref(),
     ) {
         return Ok(blocked_scraper_response());
     }
@@ -2618,6 +2618,11 @@ mod tests {
             scraper
         ));
         assert!(!should_block_scraper("GET", "/ap/users/alice", scraper));
+        assert!(!should_block_scraper(
+            "GET",
+            "/ap/users/alice..bob",
+            scraper
+        ));
         assert!(!should_block_scraper("GET", "/nodeinfo/2.0", scraper));
         assert!(!should_block_scraper("OPTIONS", "/api/videos", scraper));
         assert!(!should_block_scraper("options", "/api/videos", scraper));
