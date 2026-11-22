@@ -25,6 +25,67 @@ const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const RETIRED_SYSTEM_BODY: &str = "Gone\n";
+const BLOCKED_SCRAPER_BODY: &str = "Forbidden\n";
+const BLOCKED_SCRAPER_CACHE_CONTROL: &str = "public, max-age=3600";
+
+/// Known AI training and aggressive SEO scraper user-agent tokens blocked at
+/// the edge before reaching divine-web SSR or Funnelcake origin.
+///
+/// Legitimate search engines (`Googlebot`, `Bingbot`, `DuckDuckBot`, `Applebot`
+/// without `-Extended`, `YandexBot`) and social link-preview crawlers
+/// (`facebookexternalhit`, `Twitterbot`, `Slackbot`, `Discordbot`, `TelegramBot`,
+/// `WhatsApp`, `Signal`, `LinkedInBot`) are intentionally NOT in this list.
+const BLOCKED_SCRAPER_USER_AGENTS: &[&str] = &[
+    "gptbot",
+    "chatgpt-user",
+    "oai-searchbot",
+    "claudebot",
+    "claude-web",
+    "anthropic-ai",
+    "bytespider",
+    "amazonbot",
+    "meta-externalagent",
+    "meta-externalfetcher",
+    "ccbot",
+    "petalbot",
+    "semrushbot",
+    "ahrefsbot",
+    "mj12bot",
+    "dotbot",
+    "dataforseobot",
+    "blexbot",
+    "perplexitybot",
+    "diffbot",
+    "applebot-extended",
+    "scrapy",
+    "imagesiftbot",
+    "youbot",
+];
+
+fn is_blocked_scraper_user_agent(user_agent: &str) -> bool {
+    let lower = user_agent.to_ascii_lowercase();
+    BLOCKED_SCRAPER_USER_AGENTS
+        .iter()
+        .any(|token| lower.contains(token))
+}
+
+fn is_scraper_exempt_path(path: &str) -> bool {
+    path == "/robots.txt" || path.starts_with("/.well-known/") || is_activitypub_path(path)
+}
+
+fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> bool {
+    if method.eq_ignore_ascii_case("OPTIONS") || is_scraper_exempt_path(path) {
+        return false;
+    }
+    user_agent.is_some_and(is_blocked_scraper_user_agent)
+}
+
+fn blocked_scraper_response() -> Response {
+    Response::from_status(StatusCode::FORBIDDEN)
+        .with_header(header::CONTENT_TYPE, RETIRED_SYSTEM_CONTENT_TYPE)
+        .with_header(header::CACHE_CONTROL, BLOCKED_SCRAPER_CACHE_CONTROL)
+        .with_body(BLOCKED_SCRAPER_BODY)
+}
 
 /// Pins eligible API and RSS stale reuse at the edge for 24 hours.
 ///
@@ -145,6 +206,14 @@ struct Nip05Response {
 fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
+
+    if should_block_scraper(
+        req.get_method_str(),
+        &path,
+        req.get_header_str(header::USER_AGENT),
+    ) {
+        return Ok(blocked_scraper_response());
+    }
 
     if is_candidate_host(&host) {
         return passthrough(req, CANDIDATE_API_BACKEND, &host);
@@ -2476,5 +2545,74 @@ mod tests {
         assert!(is_public_divine_host("www.divine.video"));
         assert!(!is_public_divine_host("example.com"));
         assert!(!is_public_divine_host("foo.example.com"));
+    }
+
+    #[test]
+    fn test_should_block_known_ai_and_seo_scrapers() {
+        for ua in [
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2)",
+            "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 Bytespider",
+            "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+            "Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)",
+            "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+            "meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)",
+            "CCBot/2.0 (https://commoncrawl.org/faq/)",
+            "Mozilla/5.0 (compatible; PetalBot;+https://webmaster.petalsearch.com/site/petalbot)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Applebot-Extended",
+            "Scrapy/2.11.0 (+https://scrapy.org)",
+        ] {
+            assert!(
+                should_block_scraper("GET", "/t/halo3", Some(ua)),
+                "expected scraper UA to be blocked: {ua}"
+            );
+            assert!(
+                should_block_scraper("GET", "/api/videos/123", Some(ua)),
+                "expected scraper UA to be blocked on API: {ua}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_allow_search_engines_social_previews_and_clients() {
+        for ua in [
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+            "DuckDuckBot/1.0; (+http://duckduckgo.com/duckduckbot.html)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15 (Applebot/0.1)",
+            "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            "Twitterbot/1.0",
+            "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+            "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+            "TelegramBot (like TwitterBot)",
+            "WhatsApp/2.23.20.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Dart/3.5 (dart:io)",
+        ] {
+            assert!(
+                !should_block_scraper("GET", "/video/abc", Some(ua)),
+                "expected legitimate UA to be allowed: {ua}"
+            );
+        }
+        assert!(!should_block_scraper("GET", "/video/abc", None));
+    }
+
+    #[test]
+    fn test_should_exempt_robots_well_known_activitypub_and_options() {
+        let scraper = Some("GPTBot/1.2");
+        assert!(!should_block_scraper("GET", "/robots.txt", scraper));
+        assert!(!should_block_scraper(
+            "GET",
+            "/.well-known/nostr.json",
+            scraper
+        ));
+        assert!(!should_block_scraper(
+            "GET",
+            "/.well-known/webfinger",
+            scraper
+        ));
+        assert!(!should_block_scraper("GET", "/ap/users/alice", scraper));
+        assert!(!should_block_scraper("GET", "/nodeinfo/2.0", scraper));
+        assert!(!should_block_scraper("OPTIONS", "/api/videos", scraper));
     }
 }
