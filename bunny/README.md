@@ -71,6 +71,24 @@ python3 bunny/deploy_bunny.py --name divine-router-api-middleware --mode middlew
 
 The script upserts the Edge Script, its variables and code, publishes it, then applies the Pull Zone settings and Edge Rules above.
 
+## Deliberate differences from Fastly
+
+These are intentional and covered by `src/router_test.ts`:
+
+- **Edge-only cache directives.** The 30s API fallback TTL and the `stale-if-error` pin go into `CDN-Cache-Control` (plus a shared-cache `s-maxage` for the fallback). The client's `Cache-Control` stays as the origin sent it, and `Surrogate-Control` is stripped, as Fastly does.
+- **Fallback statuses.** The fallback TTL applies only to 200, 203, 204, 206, 300, 301, 404 and 410. Fastly's hook runs for every non-5xx; here 400, 401, 403, 429 and 302 are never given a TTL.
+- **Uncacheable wins over Surrogate-Control.** An origin `Cache-Control: private`, `no-store` or `no-cache` is never stored, even when `Surrogate-Control` sets a TTL.
+- **Set-Cookie.** A response that sets a cookie is never stored at the edge.
+- **Pass routes.** Pass responses get `Cache-Control: no-store` (`private, no-store` with `Authorization`) and `CDN-Cache-Control: no-store`, so neither Bunny nor a downstream cache keeps them. Fastly's pass leaves the client header alone.
+- **Authenticated requests in middleware mode.** Any response to a request with `Authorization` is marked `private, no-store`, matching the Pull Zone Edge Rule.
+- **Standalone decompression.** Deno's `fetch` decodes gzip and br bodies (unless the upstream `Accept-Encoding` is exactly `identity`) but keeps `Content-Encoding` and the compressed `Content-Length`. The Standalone handler drops both so clients get a correctly labelled body, which the serving layer may re-compress. Confirm on Bunny's runtime before relying on Standalone mode; `fetchDecodesBodies: false` turns this off.
+
+## Known limitations
+
+- `UseStaleWhileOffline` is zone-wide. Non-API routes opt out with `stale-if-error=0` in `CDN-Cache-Control`; whether Bunny honors that header-level opt-out is unverified.
+- `deploy_bunny.py --env KEY=VALUE` puts values in the process argument list. Pass secrets such as `BUNNY_DB_TOKEN` through the Bunny dashboard or an environment-scoped secret instead.
+- Phase 2 username lookups: a Bunny Database outage makes each lookup wait up to the 5s timeout and then 404, and a missing `BUNNY_DB_URL`/`BUNNY_DB_TOKEN` silently uses an empty store. Add backoff and a startup check before enabling username routes on Bunny.
+
 ## A/B Benchmarking Against Fastly
 
 From any host or regional GCE VM (`us-central1`, `asia-northeast1` Tokyo, `europe-west2` London, `australia-southeast1` Sydney):

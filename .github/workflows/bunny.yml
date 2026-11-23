@@ -29,5 +29,5 @@ jobs:
         working-directory: bunny
         run: deno task test
 
-      - name: Test edge probe
-        run: python3 -m unittest tests.test_probe_router_edge
+      - name: Test edge probe and Bunny deploy script
+        run: python3 -m unittest tests.test_probe_router_edge tests.test_deploy_bunny

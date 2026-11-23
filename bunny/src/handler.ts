@@ -44,6 +44,12 @@ export interface RouterConfig {
   backendUrls?: Partial<Record<BackendName, string>>;
   usernameStore?: UsernameStore;
   fetcher?: typeof fetch;
+  /**
+   * Whether `fetcher` transparently decodes gzip/br response bodies (Deno's
+   * fetch does, and keeps Content-Encoding). Defaults to true. Standalone mode
+   * only; Pull Zone origin fetches are made by Bunny, not by this script.
+   */
+  fetchDecodesBodies?: boolean;
 }
 
 const HOP_BY_HOP_HEADERS = [
@@ -127,6 +133,46 @@ function buildUpstreamHeaders(
   return headers;
 }
 
+/**
+ * Deno's fetch transparently decodes gzip and br response bodies unless the
+ * request's Accept-Encoding is exactly "identity" (with no Accept-Encoding it
+ * sends its own "gzip, br"). It leaves Content-Encoding and the compressed
+ * Content-Length on the Response, so proxying it as-is serves a plain body
+ * labelled as compressed. Drop both headers when the body was decoded; the
+ * serving layer may re-compress for the client.
+ */
+export function fetchDecodedBody(
+  upstreamAcceptEncoding: string | null,
+  contentEncoding: string | null,
+): boolean {
+  const coding = (contentEncoding ?? "").trim().toLowerCase();
+  if (coding !== "gzip" && coding !== "br") {
+    return false;
+  }
+  return (upstreamAcceptEncoding ?? "").trim().toLowerCase() !== "identity";
+}
+
+function withDecodedBodyHeaders(
+  response: Response,
+  upstreamAcceptEncoding: string | null,
+  config: RouterConfig,
+): Response {
+  if (
+    config.fetchDecodesBodies === false ||
+    !fetchDecodedBody(upstreamAcceptEncoding, response.headers.get("content-encoding"))
+  ) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 const CACHEABLE_FALLBACK_STATUSES = new Set([200, 203, 204, 206, 300, 301, 404, 410]);
 
 function replaceOrAppendDirective(headerValue: string, directive: string, seconds: number): string {
@@ -160,6 +206,7 @@ export function applyResponseCachePolicy(
     // from caching pass routes, even if the origin emitted Cache-Control: public.
     headers.set("cdn-cache-control", "no-store");
     headers.set("cache-control", options.hasAuthorization ? "private, no-store" : "no-store");
+    headers.delete("surrogate-control");
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -170,14 +217,20 @@ export function applyResponseCachePolicy(
   const { hasSurrogateControl, ttlSecs, isExplicitlyUncacheable } =
     parseEffectiveCacheTtlSecs(headers);
 
-  if (isExplicitlyUncacheable) {
+  const setsCookie = headers.has("set-cookie");
+  if (isExplicitlyUncacheable || setsCookie) {
     // Never upgrade an origin private/no-store/no-cache response to publicly cacheable,
     // and ensure Cache-Control itself is uncacheable even if only Surrogate-Control was.
+    // A response that sets a cookie is per-client, so it is never stored at the edge.
     headers.set("cdn-cache-control", "no-store");
     const existingCc = headers.get("cache-control") ?? "";
-    if (!/\b(?:private|no-store|no-cache)\b/i.test(existingCc)) {
+    const needsClientNoStore = isExplicitlyUncacheable
+      ? !/\b(?:private|no-store|no-cache)\b/i.test(existingCc)
+      : existingCc === "";
+    if (needsClientNoStore) {
       headers.set("cache-control", "no-store");
     }
+    headers.delete("surrogate-control");
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -242,25 +295,25 @@ export function applyResponseCachePolicy(
         : `s-maxage=${action.ttlSecs}`,
     );
   } else if (!isServerError && sieSecs !== null) {
-    const existingCc = headers.get("cache-control");
+    // Fastly's set_stale_if_error is edge-only, so the override goes into
+    // CDN-Cache-Control (seeded from Cache-Control when absent) and the client's
+    // Cache-Control stays exactly as the origin sent it.
+    const edgeBase = headers.get("cdn-cache-control") ?? headers.get("cache-control");
     if (sieSecs === 0) {
       // Explicitly opt non-API/non-RSS cacheable routes out of Pull Zone stale-if-error,
       // overriding any origin-supplied stale-if-error directive.
-      if (existingCc) {
-        headers.set("cache-control", replaceOrAppendStaleIfError(existingCc, 0));
-      }
-      const existingCdnCc = headers.get("cdn-cache-control");
-      if (existingCdnCc) {
-        headers.set("cdn-cache-control", replaceOrAppendStaleIfError(existingCdnCc, 0));
-      } else if (existingCc) {
-        headers.set("cdn-cache-control", replaceOrAppendStaleIfError(existingCc, 0));
-      } else {
-        headers.set("cdn-cache-control", "stale-if-error=0");
-      }
-    } else if (existingCc && !/stale-if-error/i.test(existingCc)) {
-      headers.set("cache-control", `${existingCc}, stale-if-error=${sieSecs}`);
+      headers.set(
+        "cdn-cache-control",
+        edgeBase ? replaceOrAppendStaleIfError(edgeBase, 0) : "stale-if-error=0",
+      );
+    } else if (edgeBase && !/stale-if-error/i.test(edgeBase)) {
+      headers.set("cdn-cache-control", `${edgeBase}, stale-if-error=${sieSecs}`);
     }
   }
+
+  // Surrogate-Control is an edge-only header (mirrored into CDN-Cache-Control
+  // above); Fastly never forwards it to clients.
+  headers.delete("surrogate-control");
 
   return new Response(response.body, {
     status: response.status,
@@ -338,12 +391,13 @@ async function handleUsernameRequest(
     headers.set("x-original-host", originalHost);
     const targetUrl = upstreamUrlFor(MAIN_BACKEND, url, config);
     const method = request.method.toUpperCase();
-    return await fetcher(targetUrl, {
+    const profileResponse = await fetcher(targetUrl, {
       method,
       headers,
       body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
       redirect: "manual",
     });
+    return withDecodedBodyHeaders(profileResponse, headers.get("accept-encoding"), config);
   }
 
   return buildUsernameNotFoundResponse(username);
@@ -412,7 +466,11 @@ export function createRouterHandler(
           redirect: "manual",
         });
 
-        return applyResponseCachePolicy(originResponse, cacheMode, { hasAuthorization });
+        return applyResponseCachePolicy(
+          withDecodedBodyHeaders(originResponse, upstreamHeaders.get("accept-encoding"), config),
+          cacheMode,
+          { hasAuthorization },
+        );
       }
     }
   };
@@ -427,8 +485,17 @@ export function createRouterHandler(
  * - `onOriginResponse`: stamps fallback 30s TTL / pass no-store cache directives
  *   before Bunny stores the response in its edge cache.
  */
+/**
+ * Marks origin requests this middleware built. `onOriginResponse` trusts the
+ * router-set X-Original-Host only when the marker carries this isolate's
+ * random token, so a client-supplied X-Original-Host is never trusted even if
+ * the runtime hands `onOriginResponse` the client's own request.
+ */
+export const ROUTER_HOP_HEADER = "x-divine-router-hop";
+
 export function createPullZoneMiddleware(config: RouterConfig = {}) {
   const store = config.usernameStore ?? new NullUsernameStore();
+  const hopToken = crypto.randomUUID();
 
   const onOriginRequest = async (ctx: { request: Request }): Promise<Request | Response> => {
     const request = ctx.request;
@@ -472,6 +539,7 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       headers.delete("upgrade");
       headers.set("host", MAIN_BACKEND_HOST);
       headers.set("x-original-host", originalHost);
+      headers.set(ROUTER_HOP_HEADER, hopToken);
       return new Request(upstreamUrlFor(MAIN_BACKEND, url, config), {
         method,
         headers,
@@ -499,6 +567,7 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       cacheMode,
       path,
     );
+    upstreamHeaders.set(ROUTER_HOP_HEADER, hopToken);
     return new Request(upstreamUrlFor(decision.backend, url, config), {
       method,
       headers: upstreamHeaders,
@@ -513,18 +582,26 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
   }): Promise<Response> => {
     const request = ctx.request;
     const url = new URL(request.url);
+    const builtByRouter = request.headers.get(ROUTER_HOP_HEADER) === hopToken;
+    const routerOriginalHost = builtByRouter ? request.headers.get("x-original-host") : null;
     const originalHost =
-      config.publicHostOverride ??
-      request.headers.get("x-original-host") ??
-      resolvePublicHost(request, config);
+      config.publicHostOverride ?? routerOriginalHost ?? resolvePublicHost(request, config);
     const method = request.method.toUpperCase();
     const path = url.pathname;
+    const hasAuthorization = request.headers.has("authorization");
+    if (hasAuthorization) {
+      // The Pull Zone cache key ignores Authorization, so a response to an
+      // authenticated request is never stored, whatever the route. This matches
+      // the "mark Authorization responses private no-store" Edge Rule.
+      return Promise.resolve(
+        applyResponseCachePolicy(ctx.response, { kind: "Pass" }, { hasAuthorization }),
+      );
+    }
     const decision = routeDecisionFor(originalHost, method, path);
     if (decision.kind !== "Passthrough") {
       return Promise.resolve(ctx.response);
     }
 
-    const hasAuthorization = request.headers.has("authorization");
     const isWebsocketUpgrade =
       (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
     const cacheMode = passthroughCacheMode(
