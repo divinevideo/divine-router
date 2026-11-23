@@ -50,6 +50,14 @@ export interface RouterConfig {
    * only; Pull Zone origin fetches are made by Bunny, not by this script.
    */
   fetchDecodesBodies?: boolean;
+  /**
+   * Pull Zone Middleware only: value of the hop marker that lets
+   * `onOriginResponse` trust the router-set X-Original-Host. Set it (via
+   * `ROUTER_HOP_TOKEN`) so requests built in one isolate are recognised in
+   * another; unset, each isolate uses its own random value, and a mismatch
+   * fails closed (the response is treated as pass).
+   */
+  hopToken?: string;
 }
 
 const HOP_BY_HOP_HEADERS = [
@@ -260,8 +268,9 @@ export function applyResponseCachePolicy(
       let mirrored = surrogateControl;
       if (sieSecs === 0) {
         mirrored = replaceOrAppendStaleIfError(mirrored, 0);
-      } else if (sieSecs !== null && !/stale-if-error/i.test(mirrored)) {
-        mirrored = `${mirrored}, stale-if-error=${sieSecs}`;
+      } else if (sieSecs !== null) {
+        // Fastly's set_stale_if_error pins the value regardless of the origin.
+        mirrored = replaceOrAppendStaleIfError(mirrored, sieSecs);
       }
       headers.set("cdn-cache-control", mirrored);
     }
@@ -306,8 +315,10 @@ export function applyResponseCachePolicy(
         "cdn-cache-control",
         edgeBase ? replaceOrAppendStaleIfError(edgeBase, 0) : "stale-if-error=0",
       );
-    } else if (edgeBase && !/stale-if-error/i.test(edgeBase)) {
-      headers.set("cdn-cache-control", `${edgeBase}, stale-if-error=${sieSecs}`);
+    } else if (edgeBase) {
+      // Pin the edge value, as Fastly's set_stale_if_error does, even when the
+      // origin sent its own stale-if-error.
+      headers.set("cdn-cache-control", replaceOrAppendStaleIfError(edgeBase, sieSecs));
     }
   }
 
@@ -495,7 +506,7 @@ export const ROUTER_HOP_HEADER = "x-divine-router-hop";
 
 export function createPullZoneMiddleware(config: RouterConfig = {}) {
   const store = config.usernameStore ?? new NullUsernameStore();
-  const hopToken = crypto.randomUUID();
+  const hopToken = config.hopToken || crypto.randomUUID();
 
   const onOriginRequest = async (ctx: { request: Request }): Promise<Request | Response> => {
     const request = ctx.request;

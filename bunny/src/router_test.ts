@@ -1114,3 +1114,41 @@ Deno.test("standalone proxy keeps Content-Encoding consistent with what real fet
     await origin.shutdown();
   }
 });
+
+Deno.test("API stale-if-error pin overrides an origin-supplied stale-if-error at the edge", async () => {
+  const handler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=10, stale-if-error=60" },
+        }),
+      ),
+  });
+  const resp = await handler(
+    new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
+  );
+  assertEquals(resp.headers.get("cache-control"), "public, max-age=10, stale-if-error=60");
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+});
+
+Deno.test("a configured hop token is honored across middleware instances (separate isolates)", async () => {
+  const requestSide = createPullZoneMiddleware({ hopToken: "shared-secret" });
+  const responseSide = createPullZoneMiddleware({ hopToken: "shared-secret" });
+  const built = await requestSide.onOriginRequest({
+    request: new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video" },
+    }),
+  }) as Request;
+  const resp = await responseSide.onOriginResponse({
+    request: built,
+    response: new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=10" } }),
+  });
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+});
