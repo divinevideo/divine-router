@@ -99,6 +99,10 @@ def find_pull_zone_by_name(client: BunnyClient, name: str) -> Optional[Dict[str,
 
 
 def upsert_env_vars(client: BunnyClient, script_id: int, env_vars: Dict[str, str]) -> None:
+    """Upsert non-secret Edge Script variables (Bunny reads the runtime value from DefaultValue).
+
+    Do not pass credentials via --env; store secrets in Bunny Edge Script Secrets instead.
+    """
     if not env_vars:
         return
     script = client.request("GET", f"/compute/script/{script_id}")
