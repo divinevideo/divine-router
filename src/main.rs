@@ -707,6 +707,10 @@ fn strict_tv_cache_lease(
     (max_age > 0).then(|| Duration::from_secs(max_age).min(STRICT_TV_MAX_AGE))
 }
 
+fn strict_tv_lease_expired(lease: Option<Duration>, age: Duration) -> bool {
+    lease.is_some_and(|lease| age >= lease)
+}
+
 fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
     let key = strict_tv_cache_key(public_host, req.get_url());
     req.set_cache_key(key);
@@ -723,11 +727,15 @@ fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
             candidate.get_header_str("surrogate-control"),
             candidate.get_header_str("surrogate-key"),
         );
+        let age = candidate.get_age();
+        if strict_tv_lease_expired(lease, age) {
+            return Err(SendErrorCause::DestinationUnavailable);
+        }
         candidate.set_stale_if_error(Duration::ZERO);
         candidate.set_stale_while_revalidate(Duration::ZERO);
         let remaining = lease
             .unwrap_or_default()
-            .saturating_sub(candidate.get_age())
+            .saturating_sub(age)
             .min(candidate.get_ttl());
         if remaining.is_zero() {
             candidate.set_uncacheable(false);
@@ -769,7 +777,6 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
     let tv_request = if backend == FUNNELCAKE_API_BACKEND
         && matches!(classify_host(original_host), HostType::System(ref subdomain) if subdomain == "api")
         && req.get_method_str() == "GET"
-        && !is_websocket_upgrade
     {
         tv_request(&path, req.get_url())
     } else {
@@ -869,6 +876,21 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
             response.get_header_str(STRICT_TV_POLICY_HEADER),
         ) {
             return Ok(strict_tv_unavailable());
+        }
+        if cache_mode == PassthroughCacheMode::Pass && response.get_status().is_success() {
+            let age = response
+                .get_header_str(header::AGE)
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(Duration::ZERO, Duration::from_secs);
+            let lease = strict_tv_cache_lease(
+                response.get_status(),
+                response.get_header_str("surrogate-control"),
+                response.get_header_str("surrogate-key"),
+            );
+            // A caller-private request should not be answered by an upstream cache.
+            if !age.is_zero() && lease.is_none() || strict_tv_lease_expired(lease, age) {
+                return Ok(strict_tv_unavailable());
+            }
         }
         // This runs after the readthrough cache decision. TV clients should
         // always return to the edge so moderation purges reach each new read.
@@ -2466,6 +2488,15 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             None
         ));
+    }
+
+    #[test]
+    fn strict_tv_cache_rejects_an_exhausted_lease() {
+        let lease = Some(Duration::from_secs(1));
+        assert!(!strict_tv_lease_expired(lease, Duration::from_millis(999)));
+        assert!(strict_tv_lease_expired(lease, Duration::from_secs(1)));
+        assert!(strict_tv_lease_expired(lease, Duration::from_secs(2)));
+        assert!(!strict_tv_lease_expired(None, Duration::from_secs(2)));
     }
 
     #[test]
