@@ -72,10 +72,8 @@ export function resolvePublicHost(request: Request, config?: RouterConfig): stri
 }
 
 export function resolveRequestProto(request: Request): "http" | "https" {
-  const xfProto = request.headers.get("x-forwarded-proto");
-  if (xfProto?.toLowerCase() === "http") {
-    return "http";
-  }
+  // Derive strictly from the incoming request URL scheme (matching src/main.rs)
+  // rather than trusting client-supplied X-Forwarded-Proto headers.
   try {
     return new URL(request.url).protocol === "http:" ? "http" : "https";
   } catch {
@@ -137,15 +135,17 @@ function buildUpstreamHeaders(
 export function applyResponseCachePolicy(
   response: Response,
   cacheMode: PassthroughCacheMode,
+  options: { hasAuthorization?: boolean } = {},
 ): Response {
   const headers = new Headers(response.headers);
 
   if (cacheMode.kind === "Pass") {
-    // Ensure a fronting Bunny Pull Zone never caches pass routes.
-    if (!headers.has("cdn-cache-control")) {
-      headers.set("cdn-cache-control", "no-store");
-    }
-    if (!headers.has("cache-control")) {
+    // Unconditionally prevent fronting Bunny Pull Zones from caching pass routes,
+    // even if the origin emitted Cache-Control: public.
+    headers.set("cdn-cache-control", "no-store");
+    if (options.hasAuthorization) {
+      headers.set("cache-control", "private, no-store");
+    } else if (!headers.has("cache-control")) {
       headers.set("cache-control", "no-store");
     }
     return new Response(response.body, {
@@ -155,7 +155,19 @@ export function applyResponseCachePolicy(
     });
   }
 
-  const { hasSurrogateControl, ttlSecs } = parseEffectiveCacheTtlSecs(headers);
+  const { hasSurrogateControl, ttlSecs, isExplicitlyUncacheable } =
+    parseEffectiveCacheTtlSecs(headers);
+
+  if (isExplicitlyUncacheable) {
+    // Never upgrade an origin private/no-store/no-cache response to publicly cacheable.
+    headers.set("cdn-cache-control", "no-store");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
   const isServerError = response.status >= 500 && response.status <= 599;
   const action = candidateCacheAction(
     cacheMode.honorsOriginStaleIfError,
@@ -175,37 +187,47 @@ export function applyResponseCachePolicy(
   const surrogateControl = headers.get("surrogate-control");
   if (!isServerError && surrogateControl) {
     if (!headers.has("cdn-cache-control")) {
-      headers.set("cdn-cache-control", surrogateControl);
+      let mirrored = surrogateControl;
+      if (sieSecs !== null && !/stale-if-error/i.test(mirrored)) {
+        mirrored = `${mirrored}, stale-if-error=${sieSecs}`;
+      }
+      headers.set("cdn-cache-control", mirrored);
     }
     const existingCc = headers.get("cache-control");
     const surrogateMaxAge = surrogateControl.match(/(?:^|,|\s)max-age\s*=\s*(\d+)/i);
     if (
       existingCc &&
       surrogateMaxAge &&
-      !/s-maxage/i.test(existingCc) &&
-      !/no-store|private/i.test(existingCc)
+      !/s-maxage/i.test(existingCc)
     ) {
       headers.set("cache-control", `${existingCc}, s-maxage=${surrogateMaxAge[1]}`);
     }
   }
 
   if (action.kind === "SetFallbackTtl") {
-    const directives = [`public`, `max-age=${action.ttlSecs}`];
-    if (sieSecs && sieSecs > 0) {
+    const directives = ["public", `max-age=${action.ttlSecs}`];
+    if (sieSecs !== null) {
       directives.push(`stale-if-error=${sieSecs}`);
     }
-    headers.set("cache-control", directives.join(", "));
-  } else if (
-    !isServerError &&
-    sieSecs === EDGE_STALE_IF_ERROR_SECS &&
-    headers.has("cache-control") &&
-    !/stale-if-error/i.test(headers.get("cache-control") ?? "") &&
-    !/no-store|private/i.test(headers.get("cache-control") ?? "")
-  ) {
-    headers.set(
-      "cache-control",
-      `${headers.get("cache-control")}, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
-    );
+    const ccValue = directives.join(", ");
+    headers.set("cache-control", ccValue);
+    if (!headers.has("cdn-cache-control")) {
+      headers.set("cdn-cache-control", ccValue);
+    }
+  } else if (!isServerError && sieSecs !== null) {
+    const existingCc = headers.get("cache-control");
+    if (existingCc && !/stale-if-error/i.test(existingCc)) {
+      headers.set("cache-control", `${existingCc}, stale-if-error=${sieSecs}`);
+    }
+    if (sieSecs === 0) {
+      // Explicitly opt non-API/non-RSS cacheable routes out of Pull Zone stale-if-error.
+      const existingCdnCc = headers.get("cdn-cache-control");
+      if (existingCdnCc && !/stale-if-error/i.test(existingCdnCc)) {
+        headers.set("cdn-cache-control", `${existingCdnCc}, stale-if-error=0`);
+      } else if (!existingCdnCc && existingCc) {
+        headers.set("cdn-cache-control", `${existingCc}, stale-if-error=0`);
+      }
+    }
   }
 
   return new Response(response.body, {
@@ -354,7 +376,7 @@ export function createRouterHandler(
           redirect: "manual",
         });
 
-        return applyResponseCachePolicy(originResponse, cacheMode);
+        return applyResponseCachePolicy(originResponse, cacheMode, { hasAuthorization });
       }
     }
   };
@@ -408,6 +430,10 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
         return buildUsernameNotFoundResponse(decision.username);
       }
       const headers = new Headers(request.headers);
+      for (const h of HOP_BY_HOP_HEADERS) {
+        headers.delete(h);
+      }
+      headers.delete("upgrade");
       headers.set("host", MAIN_BACKEND_HOST);
       headers.set("x-original-host", originalHost);
       return new Request(upstreamUrlFor(MAIN_BACKEND, url, config), {
@@ -452,7 +478,9 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
     const request = ctx.request;
     const url = new URL(request.url);
     const originalHost =
-      request.headers.get("x-original-host") ?? resolvePublicHost(request, config);
+      config.publicHostOverride ??
+      request.headers.get("x-original-host") ??
+      resolvePublicHost(request, config);
     const method = request.method.toUpperCase();
     const path = url.pathname;
     const decision = routeDecisionFor(originalHost, method, path);
@@ -471,7 +499,9 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       isWebsocketUpgrade,
       decision.backend,
     );
-    return Promise.resolve(applyResponseCachePolicy(ctx.response, cacheMode));
+    return Promise.resolve(
+      applyResponseCachePolicy(ctx.response, cacheMode, { hasAuthorization }),
+    );
   };
 
   return { onOriginRequest, onOriginResponse };

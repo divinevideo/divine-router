@@ -275,39 +275,61 @@ class EdgeSession:
         capture_body: bool = False,
     ) -> Tuple[Sample, Optional[bytes]]:
         connect_ms = None
-        try:
-            if self.conn is None or not self.reuse:
-                self.close()
-                connect_ms = self._connect()
+        for attempt in range(2):
+            reused = self.conn is not None and self.reuse
+            try:
+                if self.conn is None or not self.reuse:
+                    self.close()
+                    connect_ms = self._connect()
 
-            req_headers = {
-                "Host": self.host_header,
-                "User-Agent": "divine-router-probe/1",
-                "Accept-Encoding": "gzip",
-                "Connection": "keep-alive",
-            }
-            if extra_headers:
-                req_headers.update(extra_headers)
+                req_headers = {
+                    "Host": self.host_header,
+                    "User-Agent": "divine-router-probe/1",
+                    "Accept-Encoding": "gzip",
+                    "Connection": "keep-alive",
+                }
+                if extra_headers:
+                    req_headers.update(extra_headers)
 
-            started = time.perf_counter()
-            self.conn.request("GET", path, headers=req_headers)
-            resp = self.conn.getresponse()
-            ttfb = (time.perf_counter() - started) * 1000.0
+                started = time.perf_counter()
+                self.conn.request("GET", path, headers=req_headers)
+                resp = self.conn.getresponse()
+                ttfb = (time.perf_counter() - started) * 1000.0
 
-            chunks: List[bytes] = []
-            read = 0
-            while True:
-                chunk = resp.read(READ_CHUNK)
-                if not chunk:
-                    break
-                read += len(chunk)
-                if capture_body:
-                    chunks.append(chunk)
-            total = (time.perf_counter() - started) * 1000.0
+                chunks: List[bytes] = []
+                read = 0
+                while True:
+                    chunk = resp.read(READ_CHUNK)
+                    if not chunk:
+                        break
+                    read += len(chunk)
+                    if capture_body:
+                        chunks.append(chunk)
+                total = (time.perf_counter() - started) * 1000.0
 
-            headers = resp.headers
-            if resp.status >= 400:
-                self.close()
+                headers = resp.headers
+                if resp.status >= 400:
+                    self.close()
+                    return (
+                        Sample(
+                            edge=edge,
+                            region=region,
+                            ttfb_ms=ttfb,
+                            total_ms=total,
+                            bytes_read=read,
+                            error=f"HTTP {resp.status}",
+                            path=path,
+                            status=resp.status,
+                            cache_status=select_cache_status(headers),
+                            cache_headers=capture_cache_headers(headers),
+                            content_encoding=headers.get("content-encoding"),
+                            cache_control=headers.get("cache-control"),
+                            served_by=headers.get("x-served-by") or headers.get("server"),
+                            connect_ms=connect_ms,
+                        ),
+                        b"".join(chunks) if capture_body else None,
+                    )
+
                 return (
                     Sample(
                         edge=edge,
@@ -315,7 +337,7 @@ class EdgeSession:
                         ttfb_ms=ttfb,
                         total_ms=total,
                         bytes_read=read,
-                        error=f"HTTP {resp.status}",
+                        error=None,
                         path=path,
                         status=resp.status,
                         cache_status=select_cache_status(headers),
@@ -327,41 +349,42 @@ class EdgeSession:
                     ),
                     b"".join(chunks) if capture_body else None,
                 )
-
-            return (
-                Sample(
-                    edge=edge,
-                    region=region,
-                    ttfb_ms=ttfb,
-                    total_ms=total,
-                    bytes_read=read,
-                    error=None,
-                    path=path,
-                    status=resp.status,
-                    cache_status=select_cache_status(headers),
-                    cache_headers=capture_cache_headers(headers),
-                    content_encoding=headers.get("content-encoding"),
-                    cache_control=headers.get("cache-control"),
-                    served_by=headers.get("x-served-by") or headers.get("server"),
-                    connect_ms=connect_ms,
-                ),
-                b"".join(chunks) if capture_body else None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.close()
-            return (
-                Sample(
-                    edge=edge,
-                    region=region,
-                    ttfb_ms=0.0,
-                    total_ms=0.0,
-                    bytes_read=0,
-                    error=type(exc).__name__,
-                    path=path,
-                    connect_ms=connect_ms,
-                ),
-                None,
-            )
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+                self.close()
+                if reused and attempt == 0:
+                    continue
+                return (
+                    Sample(
+                        edge=edge,
+                        region=region,
+                        ttfb_ms=0.0,
+                        total_ms=0.0,
+                        bytes_read=0,
+                        error="RemoteDisconnected",
+                        path=path,
+                        connect_ms=connect_ms,
+                    ),
+                    None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.close()
+                return (
+                    Sample(
+                        edge=edge,
+                        region=region,
+                        ttfb_ms=0.0,
+                        total_ms=0.0,
+                        bytes_read=0,
+                        error=type(exc).__name__,
+                        path=path,
+                        connect_ms=connect_ms,
+                    ),
+                    None,
+                )
+        return (
+            Sample(edge=edge, region=region, ttfb_ms=0.0, total_ms=0.0, bytes_read=0, error="RetryExhausted", path=path),
+            None,
+        )
 
 
 def run_contract_checks(
@@ -403,7 +426,7 @@ def run_contract_checks(
         },
     )
     report.auth_bypass_cache_status = auth_sample.cache_status
-    if auth_sample.error is None:
+    if auth_sample.status is not None:
         report.auth_bypass_ok = not is_cache_hit(auth_sample.cache_status)
 
     # 3. Cold miss measurement with a unique query parameter
@@ -570,7 +593,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump(payload, fh, indent=2)
         print(f"\nwrote {args.json}", file=sys.stderr)
 
-    return 0 if all(v.verdict == "PASS" for v in verdicts) else 1
+    contracts_ok = all(
+        report.auth_bypass_ok is not False
+        for name, report in contracts.items()
+        if name != args.baseline
+    )
+    return 0 if (all(v.verdict == "PASS" for v in verdicts) and contracts_ok) else 1
 
 
 if __name__ == "__main__":

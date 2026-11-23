@@ -88,7 +88,19 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
     private readonly authToken: string,
     private readonly ttlMs = 30_000,
     private readonly fetcher: typeof fetch = fetch,
+    private readonly maxCacheEntries = 10_000,
+    private readonly timeoutMs = 5_000,
   ) {}
+
+  private setCache(key: string, value: UsernameData | null, expiresAt: number): void {
+    if (this.cache.size >= this.maxCacheEntries && !this.cache.has(key)) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      }
+    }
+    this.cache.set(key, { value, expiresAt });
+  }
 
   async lookup(username: string): Promise<UsernameData | null> {
     const key = username.toLowerCase();
@@ -106,6 +118,7 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
           "content-type": "application/json",
           authorization: `Bearer ${this.authToken}`,
         },
+        signal: AbortSignal.timeout(this.timeoutMs),
         body: JSON.stringify({
           requests: [
             {
@@ -136,7 +149,7 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
 
       const row = payload.results?.[0]?.response?.result?.rows?.[0];
       if (!row || !row[0]?.value) {
-        this.cache.set(key, { value: null, expiresAt: now + this.ttlMs });
+        this.setCache(key, null, now + this.ttlMs);
         return null;
       }
 
@@ -159,7 +172,7 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
         atproto_did: row[3]?.value ?? null,
         atproto_state: row[4]?.value ?? null,
       };
-      this.cache.set(key, { value: record, expiresAt: now + this.ttlMs });
+      this.setCache(key, record, now + this.ttlMs);
       return record;
     } catch {
       return null;

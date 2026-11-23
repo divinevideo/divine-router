@@ -26,9 +26,10 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 API_BASE = "https://api.bunny.net"
 DEFAULT_KEY_PATH = Path.home() / ".config" / "divine-cdn" / "bunny-api-key"
@@ -111,13 +112,13 @@ def upsert_env_vars(client: BunnyClient, script_id: int, env_vars: Dict[str, str
             client.request(
                 "POST",
                 f"/compute/script/{script_id}/variables/{var_id}",
-                {"Name": k, "Value": v, "Required": False, "DefaultValue": v},
+                {"Name": k, "Value": v, "Required": False, "DefaultValue": ""},
             )
         else:
             client.request(
                 "POST",
                 f"/compute/script/{script_id}/variables/add",
-                {"Name": k, "Value": v, "Required": False, "DefaultValue": v},
+                {"Name": k, "Value": v, "Required": False, "DefaultValue": ""},
             )
 
 
@@ -173,6 +174,69 @@ def configure_api_pull_zone(
             ],
         },
         {
+            "Description": "divine-router: mark Authorization responses private no-store",
+            "Enabled": True,
+            "ActionType": 5,  # SetResponseHeader
+            "ActionParameter1": "Cache-Control",
+            "ActionParameter2": "private, no-store",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 1,  # RequestHeader
+                    "PatternMatchingType": 0,  # MatchAny
+                    "Parameter1": "Authorization",
+                    "PatternMatches": ["*"],
+                }
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for candidate hosts",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 0,  # Url
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": [
+                        "https://api2.divine.video/*",
+                        "http://api2.divine.video/*",
+                        "https://relay2.divine.video/*",
+                        "http://relay2.divine.video/*",
+                    ],
+                },
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for non-GET methods",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 9,  # RequestMethod
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                },
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for HEAD requests",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 9,  # RequestMethod
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": ["HEAD"],
+                },
+            ],
+        },
+        {
             "Description": "divine-router: bypass cache for well-known, AP, and docs routes",
             "Enabled": True,
             "ActionType": 3,  # OverrideCacheTime
@@ -183,17 +247,17 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "*/.well-known/*",
-                        "*/ap",
-                        "*/ap/*",
-                        "*/nodeinfo*",
-                        "*/api/docs*",
+                        "https://*/.well-known/*",
+                        "https://*/ap",
+                        "https://*/ap/*",
+                        "https://*/nodeinfo",
+                        "https://*/api/docs*",
                     ],
                 },
             ],
         },
         {
-            "Description": "divine-router: bypass cache for mobile API and short links",
+            "Description": "divine-router: bypass cache for exact mobile API routes",
             "Enabled": True,
             "ActionType": 3,  # OverrideCacheTime
             "ActionParameter1": "0",
@@ -203,16 +267,17 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "*/v1/*",
-                        "*/api/zendesk/*",
-                        "*/l/*",
-                        "*/api/links*",
+                        "https://*/v1/account/moderation-status",
+                        "https://*/v1/minor-review-cases/greenlight",
+                        "https://*/v1/minor-review-cases/*/parent-contact",
+                        "https://*/v1/minor-review-cases/*/parent-consent",
+                        "https://*/api/zendesk/pre-auth",
                     ],
                 },
             ],
         },
         {
-            "Description": "divine-router: bypass cache for sound proxy routes",
+            "Description": "divine-router: bypass cache for short links",
             "Enabled": True,
             "ActionType": 3,  # OverrideCacheTime
             "ActionParameter1": "0",
@@ -222,14 +287,60 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "*/api/sounds/providers*",
-                        "*/api/sounds/trending*",
-                        "*/api/sounds/*/videos*",
+                        "https://divine.video/l",
+                        "https://divine.video/l/*",
+                        "https://www.divine.video/l",
+                        "https://www.divine.video/l/*",
+                        "https://divine.video/api/links*",
+                    ],
+                },
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for exact sound proxy routes",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 0,  # Url
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": [
+                        "https://*/api/sounds/providers",
+                        "https://*/api/sounds/providers?*",
+                        "https://*/api/sounds/trending",
+                        "https://*/api/sounds/trending?*",
+                        "https://*/api/sounds/*/videos",
+                    ],
+                },
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for sound proxy videos with query",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 0,  # Url
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": [
+                        "https://*/api/sounds/*/videos?*",
+                        "https://*/nodeinfo/*",
                     ],
                 },
             ],
         },
     ]
+
+    desired_descriptions = {r["Description"] for r in desired_rules}
+    for desc, existing in existing_rules.items():
+        if desc and desc.startswith("divine-router:") and desc not in desired_descriptions:
+            guid = existing.get("Guid")
+            if guid:
+                client.request("DELETE", f"/pullzone/{pull_zone_id}/edgerules/{guid}")
 
     for rule in desired_rules:
         if rule["Description"] in existing_rules:
@@ -239,14 +350,13 @@ def configure_api_pull_zone(
     return client.request("GET", f"/pullzone/{pull_zone_id}")
 
 
-def parse_env_args(items: Optional[List[str]]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for item in items or []:
-        if "=" not in item:
-            raise argparse.ArgumentTypeError(f"--env expects KEY=VALUE, got {item!r}")
-        k, v = item.split("=", 1)
-        out[k] = v
-    return out
+def parse_env_pair(item: str) -> Tuple[str, str]:
+    if "=" not in item:
+        raise argparse.ArgumentTypeError(f"--env expects KEY=VALUE, got {item!r}")
+    k, v = item.split("=", 1)
+    if not k:
+        raise argparse.ArgumentTypeError(f"--env key must not be empty, got {item!r}")
+    return k, v
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -255,7 +365,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--mode", choices=["standalone", "middleware"], required=True)
     ap.add_argument("--bundle", required=True, help="Path to bundled JS file")
     ap.add_argument("--origin", default="https://relay.divine.video", help="Origin URL for middleware Pull Zone")
-    ap.add_argument("--env", action="append", help="Environment variable KEY=VALUE (repeatable)")
+    ap.add_argument("--env", action="append", type=parse_env_pair, help="Environment variable KEY=VALUE (repeatable)")
     ap.add_argument("--hostname", action="append", help="Attach custom hostname to Pull Zone (repeatable)")
     ap.add_argument(
         "--load-free-cert",
@@ -270,7 +380,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: bundle not found: {bundle_path}", file=sys.stderr)
         return 2
     code = bundle_path.read_text(encoding="utf-8")
-    env_vars = parse_env_args(args.env)
+    env_vars = dict(args.env or [])
 
     client = BunnyClient(load_api_key())
     script = find_script_by_name(client, args.name)
@@ -327,7 +437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 client.request("POST", f"/pullzone/{pull_zone_id}/addHostname", {"Hostname": hostname})
                 print(f"Added custom hostname {hostname} to Pull Zone {pull_zone_id}")
             if args.load_free_cert:
-                client.request("GET", f"/pullzone/loadFreeCertificate?hostname={hostname}")
+                encoded_host = urllib.parse.quote(hostname, safe="")
+                client.request("GET", f"/pullzone/loadFreeCertificate?hostname={encoded_host}")
                 client.request(
                     "POST",
                     f"/pullzone/{pull_zone_id}/setForceSSL",

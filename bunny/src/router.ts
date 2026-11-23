@@ -627,13 +627,17 @@ export function buildAtprotoDidResponse(userData: UsernameData | null | undefine
       headers: {
         "content-type": "text/plain",
         "access-control-allow-origin": "*",
+        "cache-control": "no-store",
       },
     });
   }
 
   return new Response("", {
     status: 404,
-    headers: { "content-type": "text/plain" },
+    headers: {
+      "content-type": "text/plain",
+      "cache-control": "no-store",
+    },
   });
 }
 
@@ -669,6 +673,7 @@ export function buildUsernameNotFoundResponse(username: string): Response {
 export function parseEffectiveCacheTtlSecs(headers: Headers): {
   hasSurrogateControl: boolean;
   ttlSecs: number;
+  isExplicitlyUncacheable: boolean;
 } {
   const surrogate = headers.get("surrogate-control");
   const hasSurrogateControl = surrogate !== null;
@@ -680,29 +685,36 @@ export function parseEffectiveCacheTtlSecs(headers: Headers): {
     return m ? Number.parseInt(m[1], 10) : null;
   };
 
+  const isUncacheableDirective = (value: string): boolean =>
+    /(?:^|,|\s)(?:no-store|private|no-cache)(?:$|,|\s|=)/i.test(value);
+
   if (surrogate) {
-    if (/no-store|private/i.test(surrogate)) {
-      return { hasSurrogateControl: true, ttlSecs: 0 };
+    if (isUncacheableDirective(surrogate)) {
+      return { hasSurrogateControl: true, ttlSecs: 0, isExplicitlyUncacheable: true };
     }
     const maxAge = parseMaxAge(surrogate, "max-age");
     if (maxAge !== null) {
-      return { hasSurrogateControl: true, ttlSecs: maxAge };
+      return {
+        hasSurrogateControl: true,
+        ttlSecs: maxAge,
+        isExplicitlyUncacheable: isUncacheableDirective(cc),
+      };
     }
   }
 
-  if (/no-store|private/i.test(cc)) {
-    return { hasSurrogateControl, ttlSecs: 0 };
+  if (isUncacheableDirective(cc)) {
+    return { hasSurrogateControl, ttlSecs: 0, isExplicitlyUncacheable: true };
   }
 
   const sMaxAge = parseMaxAge(cc, "s-maxage");
   if (sMaxAge !== null) {
-    return { hasSurrogateControl, ttlSecs: sMaxAge };
+    return { hasSurrogateControl, ttlSecs: sMaxAge, isExplicitlyUncacheable: false };
   }
 
   const maxAge = parseMaxAge(cc, "max-age");
   if (maxAge !== null) {
-    return { hasSurrogateControl, ttlSecs: maxAge };
+    return { hasSurrogateControl, ttlSecs: maxAge, isExplicitlyUncacheable: false };
   }
 
-  return { hasSurrogateControl, ttlSecs: 0 };
+  return { hasSurrogateControl, ttlSecs: 0, isExplicitlyUncacheable: false };
 }

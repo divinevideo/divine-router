@@ -132,7 +132,11 @@ def run_region(
                     b64_payload = "".join(last_output[start:end].split())
                     try:
                         raw_json = base64.b64decode(b64_payload).decode("utf-8")
-                        return region, json.loads(raw_json), ""
+                        parsed = json.loads(raw_json)
+                        if not isinstance(parsed, dict) or parsed.get("error") or not parsed.get("summaries"):
+                            err_msg = parsed.get("error") if isinstance(parsed, dict) else "unexpected payload"
+                            return region, None, f"probe failed on VM: {err_msg or 'missing summaries'}"
+                        return region, parsed, ""
                     except Exception as exc:  # noqa: BLE001
                         return region, None, f"decode/parse error: {exc}\n{b64_payload[:300]}"
         return region, None, f"timed out after {timeout_secs}s"
@@ -158,13 +162,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", required=True, help="GCP project ID for throwaway probe VMs")
     ap.add_argument("--edge", action="append", required=True)
-    ap.add_argument("--path", action="append", default=["/api/videos", "/api/videos?limit=20"])
+    ap.add_argument("--path", action="append", default=None, help="Paths to probe (defaults to /api/videos and /api/videos?limit=20)")
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--iterations", type=int, default=15)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--json", metavar="FILE", help="write combined multi-region JSON results")
     args = ap.parse_args(argv)
+    paths = args.path or ["/api/videos", "/api/videos?limit=20"]
 
     probe_path = Path(__file__).with_name("probe_router_edge.py")
     probe_source = probe_path.read_text(encoding="utf-8")
@@ -177,7 +182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         futs = {}
         for region, zone in DEFAULT_ZONES:
             startup = build_startup_script(
-                probe_source, region, args.edge, args.path, args.baseline, args.iterations, args.warmup
+                probe_source, region, args.edge, paths, args.baseline, args.iterations, args.warmup
             )
             futs[pool.submit(run_region, args.project, run_id, region, zone, startup, args.timeout)] = region
 

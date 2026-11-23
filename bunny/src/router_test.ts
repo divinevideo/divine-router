@@ -668,6 +668,87 @@ Deno.test("Pull Zone middleware rewrites origin URL and applies cache policy on 
   );
 });
 
+Deno.test("security & cache-policy regression tests: private/no-store, Pass override, X-Forwarded-Proto spoofing, stale-if-error=0", async () => {
+  // 1. Origin Cache-Control: private or no-store must NEVER be upgraded to public, max-age=30
+  for (const cc of ["private, max-age=0", "no-store", "no-cache"]) {
+    const handler = createRouterHandler({
+      fetcher: () =>
+        Promise.resolve(
+          new Response("{}", {
+            status: 200,
+            headers: { "cache-control": cc },
+          }),
+        ),
+    });
+    const resp = await handler(
+      new Request("https://api.divine.video/api/videos", {
+        headers: { host: "api.divine.video" },
+      }),
+    );
+    assertEquals(resp.headers.get("cache-control"), cc);
+    assertEquals(resp.headers.get("cdn-cache-control"), "no-store");
+  }
+
+  // 2. Pass mode (Authorization) unconditionally forces cdn-cache-control: no-store and private, no-store
+  //    even if origin sends Cache-Control: public, max-age=30
+  const authHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: {
+            "cache-control": "public, max-age=30",
+            "cdn-cache-control": "max-age=30",
+          },
+        }),
+      ),
+  });
+  const authResp = await authHandler(
+    new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video", authorization: "Nostr secret" },
+    }),
+  );
+  assertEquals(authResp.headers.get("cdn-cache-control"), "no-store");
+  assertEquals(authResp.headers.get("cache-control"), "private, no-store");
+
+  // 3. Client-supplied X-Forwarded-Proto: http on an HTTPS request must NOT be trusted
+  let seenProto = "";
+  const protoHandler = createRouterHandler({
+    fetcher: (_input, init) => {
+      seenProto = new Headers(init?.headers).get("x-forwarded-proto") ?? "";
+      return Promise.resolve(new Response("ok", { status: 200 }));
+    },
+  });
+  await protoHandler(
+    new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video", "x-forwarded-proto": "http" },
+    }),
+  );
+  assertEquals(seenProto, "https");
+
+  // 4. Non-API/non-RSS cacheable route emits stale-if-error=0 opt-out
+  const webHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("<html></html>", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=60" },
+        }),
+      ),
+  });
+  const webResp = await webHandler(
+    new Request("https://www.divine.video/", {
+      headers: { host: "www.divine.video" },
+    }),
+  );
+  assertEquals(webResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=0");
+  assertEquals(webResp.headers.get("cdn-cache-control"), "public, max-age=60, stale-if-error=0");
+
+  // 5. ATProto DID responses carry cache-control: no-store
+  const didResp = buildAtprotoDidResponse(makeAtprotoUser("pk", "did:plc:abc123", "ready"));
+  assertEquals(didResp.headers.get("cache-control"), "no-store");
+});
+
 Deno.test("BunnyDatabaseUsernameStore parses libSQL pipeline rows and caches hits", async () => {
   let calls = 0;
   const mockFetch: typeof fetch = () => {
