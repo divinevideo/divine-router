@@ -640,10 +640,12 @@ fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
     let supports_tv_view = match segments.as_slice() {
         ["", "api", "search"]
         | ["", "api", "v2", "search"]
+        | ["", "api", "featured-tabs"]
+        | ["", "api", "v2", "lists"]
         | ["", "api", "videos", _, "comments"]
         | ["", "api", "v2", "videos", _, "comments"] => false,
-        ["", "api", "videos" | "featured-tabs"]
-        | ["", "api", "v2", "videos" | "lists"]
+        ["", "api", "videos"]
+        | ["", "api", "v2", "videos"]
         | ["", "api", "lists", _, _, "items"]
         | ["", "api", "v2", "lists", _, _, "items"]
         | ["", "api", "users", _, "feed" | "recommendations"]
@@ -704,16 +706,8 @@ fn strict_tv_response_allowed(status: StatusCode, policy: Option<&str>) -> bool 
         || (status.is_success() && policy == Some(STRICT_TV_POLICY))
 }
 
-fn strict_tv_cache_lease(
-    status: StatusCode,
-    surrogate_control: Option<&str>,
-    surrogate_key: Option<&str>,
-) -> Option<Duration> {
-    if !status.is_success()
-        || !surrogate_key?
-            .split_ascii_whitespace()
-            .any(|key| key == STRICT_TV_SURROGATE_KEY)
-    {
+fn strict_tv_cache_lease(status: StatusCode, surrogate_control: Option<&str>) -> Option<Duration> {
+    if !status.is_success() {
         return None;
     }
 
@@ -733,6 +727,13 @@ fn strict_tv_lease_expired(lease: Option<Duration>, age: Duration) -> bool {
     lease.is_some_and(|lease| age >= lease)
 }
 
+fn strict_tv_pass_age_allowed(age: &fastly::http::HeaderValue) -> bool {
+    // Age is a single delta-seconds value. Absent or zero is the only age
+    // allowed on caller-private reads; surrogate headers may be stripped.
+    let digits = age.as_bytes();
+    !digits.is_empty() && digits.iter().all(|&byte| byte == b'0')
+}
+
 fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
     let key = strict_tv_cache_key(public_host, req.get_url());
     req.set_cache_key(key);
@@ -741,17 +742,17 @@ fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
     req.set_after_send(|candidate| {
         let status = candidate.get_status();
         if !strict_tv_response_allowed(status, candidate.get_header_str(STRICT_TV_POLICY_HEADER)) {
-            return Err(SendErrorCause::DestinationUnavailable);
+            return Err(SendErrorCause::Custom(Error::msg(
+                "strict TV origin policy or status rejected",
+            )));
         }
 
-        let lease = strict_tv_cache_lease(
-            status,
-            candidate.get_header_str("surrogate-control"),
-            candidate.get_header_str("surrogate-key"),
-        );
+        let lease = strict_tv_cache_lease(status, candidate.get_header_str("surrogate-control"));
         let age = candidate.get_age();
         if strict_tv_lease_expired(lease, age) {
-            return Err(SendErrorCause::DestinationUnavailable);
+            return Err(SendErrorCause::Custom(Error::msg(
+                "strict TV lease expired",
+            )));
         }
         candidate.set_stale_if_error(Duration::ZERO);
         candidate.set_stale_while_revalidate(Duration::ZERO);
@@ -759,7 +760,11 @@ fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
             .unwrap_or_default()
             .saturating_sub(age)
             .min(candidate.get_ttl());
-        if remaining.is_zero() {
+        // Check the SDK's effective storage keys, not the raw response header.
+        let has_purge_key = candidate
+            .get_surrogate_keys()
+            .any(|key| key == STRICT_TV_SURROGATE_KEY);
+        if remaining.is_zero() || !has_purge_key {
             candidate.set_uncacheable(false);
         } else {
             candidate.set_ttl(remaining);
@@ -903,22 +908,20 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
             response.get_status(),
             response.get_header_str(STRICT_TV_POLICY_HEADER),
         ) {
+            eprintln!(
+                "strict TV policy or status rejected: {}",
+                response.get_status()
+            );
             return Ok(strict_tv_unavailable());
         }
-        if cache_mode == PassthroughCacheMode::Pass && response.get_status().is_success() {
-            let age = response
-                .get_header_str(header::AGE)
-                .and_then(|value| value.parse::<u64>().ok())
-                .map_or(Duration::ZERO, Duration::from_secs);
-            let lease = strict_tv_cache_lease(
-                response.get_status(),
-                response.get_header_str("surrogate-control"),
-                response.get_header_str("surrogate-key"),
-            );
-            // A caller-private request should not be answered by an upstream cache.
-            if !age.is_zero() && lease.is_none() || strict_tv_lease_expired(lease, age) {
-                return Ok(strict_tv_unavailable());
-            }
+        if cache_mode == PassthroughCacheMode::Pass
+            && response.get_status().is_success()
+            && !response
+                .get_header_all(header::AGE)
+                .all(strict_tv_pass_age_allowed)
+        {
+            eprintln!("strict TV pass rejected a nonzero or invalid Age");
+            return Ok(strict_tv_unavailable());
         }
         // This runs after the readthrough cache decision. TV clients should
         // always return to the edge so moderation purges reach each new read.
@@ -2465,10 +2468,12 @@ mod tests {
     }
 
     #[test]
-    fn search_and_comments_require_the_strict_profile() {
+    fn strict_only_routes_reject_tv_view() {
         for path in [
             "/api/search",
             "/api/v2/search",
+            "/api/featured-tabs",
+            "/api/v2/lists",
             "/api/videos/event/comments",
             "/api/v2/videos/event/comments",
         ] {
@@ -2558,43 +2563,34 @@ mod tests {
     }
 
     #[test]
-    fn strict_tv_cache_requires_both_an_explicit_lease_and_a_purge_key() {
+    fn strict_tv_cache_lease_requires_an_explicit_success_ttl() {
         assert_eq!(
-            strict_tv_cache_lease(StatusCode::OK, Some("max-age=15"), Some("videos strict-tv")),
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=15")),
             Some(Duration::from_secs(15))
         );
         assert_eq!(
-            strict_tv_cache_lease(
-                StatusCode::OK,
-                Some("max-age=120, stale-if-error=86400"),
-                Some("strict-tv")
-            ),
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=120, stale-if-error=86400")),
             Some(Duration::from_secs(30))
         );
+        assert_eq!(strict_tv_cache_lease(StatusCode::OK, None), None);
         assert_eq!(
-            strict_tv_cache_lease(StatusCode::OK, None, Some("videos strict-tv")),
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=0")),
             None
         );
         assert_eq!(
-            strict_tv_cache_lease(StatusCode::OK, Some("max-age=0"), Some("strict-tv")),
+            strict_tv_cache_lease(StatusCode::SERVICE_UNAVAILABLE, Some("max-age=30")),
             None
         );
-        assert_eq!(
-            strict_tv_cache_lease(
-                StatusCode::OK,
-                Some("max-age=30"),
-                Some("strict-tv-preview")
-            ),
-            None
-        );
-        assert_eq!(
-            strict_tv_cache_lease(
-                StatusCode::SERVICE_UNAVAILABLE,
-                Some("max-age=30"),
-                Some("strict-tv")
-            ),
-            None
-        );
+    }
+
+    #[test]
+    fn strict_tv_pass_only_allows_zero_age() {
+        for age in ["0", "00"] {
+            assert!(strict_tv_pass_age_allowed(&age.parse().unwrap()));
+        }
+        for age in ["", "1", "0, 0", "invalid", "99999999999999999999"] {
+            assert!(!strict_tv_pass_age_allowed(&age.parse().unwrap()));
+        }
     }
 
     #[test]
