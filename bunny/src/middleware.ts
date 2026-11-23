@@ -8,6 +8,7 @@ import { createUsernameStoreFromEnv } from "./username_store.ts";
 const middleware = createPullZoneMiddleware({
   publicHostOverride: Deno.env.get("PUBLIC_HOST_OVERRIDE") || undefined,
   usernameStore: createUsernameStoreFromEnv(),
+  hopToken: Deno.env.get("ROUTER_HOP_TOKEN") || undefined,
 });
 
 const defaultOrigin = Deno.env.get("PULL_ZONE_ORIGIN_URL") || "https://relay.divine.video";

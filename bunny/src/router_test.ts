@@ -706,7 +706,7 @@ Deno.test("Pull Zone middleware rewrites origin URL and applies cache policy on 
   );
   assertEquals(
     apiResp.headers.get("cache-control"),
-    "public, max-age=10, s-maxage=30, stale-if-error=86400",
+    "public, max-age=10, s-maxage=30",
   );
 });
 
@@ -783,7 +783,7 @@ Deno.test("security & cache-policy regression tests: private/no-store, Pass over
       headers: { host: "www.divine.video" },
     }),
   );
-  assertEquals(webResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=0");
+  assertEquals(webResp.headers.get("cache-control"), "public, max-age=60");
   assertEquals(webResp.headers.get("cdn-cache-control"), "public, max-age=60, stale-if-error=0");
 
   // 5. ATProto DID and dynamic 404 responses carry cache-control: no-store
@@ -860,7 +860,7 @@ Deno.test("security & cache-policy regression tests: private/no-store, Pass over
       headers: { host: "www.divine.video" },
     }),
   );
-  assertEquals(overrideSieResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=0");
+  assertEquals(overrideSieResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=3600");
   assertEquals(overrideSieResp.headers.get("cdn-cache-control"), "public, max-age=60, stale-if-error=0");
 });
 
@@ -1028,4 +1028,225 @@ Deno.test("NameServerUsernameStore resolves /api/username/lookup/:name, falls ba
   assertEquals(await store.lookup("flaky"), null);
   assertEquals(await store.lookup("flaky"), null);
   assertEquals(calls, 6);
+});
+
+Deno.test("stale-if-error and Surrogate-Control stay at the edge; clients see origin Cache-Control", async () => {
+  for (const status of [200, 404, 429]) {
+    const handler = createRouterHandler({
+      fetcher: () =>
+        Promise.resolve(
+          new Response("{}", { status, headers: { "cache-control": "public, max-age=60" } }),
+        ),
+    });
+    const resp = await handler(
+      new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
+    );
+    assertEquals(resp.headers.get("cache-control"), "public, max-age=60");
+    assertEquals(
+      resp.headers.get("cdn-cache-control"),
+      `public, max-age=60, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+    );
+  }
+
+  const surrogateHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=10", "surrogate-control": "max-age=30" },
+        }),
+      ),
+  });
+  const surrogateResp = await surrogateHandler(
+    new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
+  );
+  assertEquals(surrogateResp.headers.get("surrogate-control"), null);
+  assertEquals(surrogateResp.headers.get("cache-control"), "public, max-age=10, s-maxage=30");
+  assertEquals(
+    surrogateResp.headers.get("cdn-cache-control"),
+    `max-age=30, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+});
+
+Deno.test("Set-Cookie responses get no-store for edge and downstream caches", async () => {
+  for (const cc of [null, "public, max-age=60"]) {
+    const headers: Record<string, string> = { "set-cookie": "sid=abc; Path=/" };
+    if (cc) headers["cache-control"] = cc;
+    const handler = createRouterHandler({
+      fetcher: () => Promise.resolve(new Response("{}", { status: 200, headers })),
+    });
+    const resp = await handler(
+      new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
+    );
+    assertEquals(resp.headers.get("cdn-cache-control"), "no-store");
+    assertEquals(resp.headers.get("cache-control"), "no-store");
+    assertEquals(resp.headers.get("set-cookie"), "sid=abc; Path=/");
+  }
+});
+
+Deno.test("An origin CDN policy suppresses the fallback and retains its edge TTL", async () => {
+  for (const edgeControl of ["no-store", "max-age=90, stale-if-error=5"]) {
+    const handler = createRouterHandler({
+      fetcher: () => Promise.resolve(new Response("{}", {
+        headers: { "cache-control": "max-age=0", "cdn-cache-control": edgeControl },
+      })),
+    });
+    const response = await handler(new Request("https://api.divine.video/api/videos"));
+    assertEquals(response.headers.get("cache-control"), "max-age=0");
+    assertEquals(
+      response.headers.get("cdn-cache-control"),
+      `${edgeControl.split(",")[0]}, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+    );
+  }
+});
+
+Deno.test("Pull Zone onOriginResponse ignores client-supplied X-Original-Host and stamps Authorization responses", async () => {
+  const { onOriginRequest, onOriginResponse } = createPullZoneMiddleware();
+
+  // A client-shaped request (public host in the URL) claiming a non-API host must
+  // still be classified by its real Host: the mobile API route stays Pass.
+  const spoofed = await onOriginResponse({
+    request: new Request("https://api.divine.video/v1/account/moderation-status", {
+      headers: { host: "api.divine.video", "x-original-host": "divine.video" },
+    }),
+    response: new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=60" } }),
+  });
+  assertEquals(spoofed.headers.get("cdn-cache-control"), "no-store");
+
+  // Authorization responses are private even when the route is not a passthrough.
+  const authProfile = await onOriginResponse({
+    request: new Request(`https://${MAIN_BACKEND_HOST}/`, {
+      headers: {
+        host: MAIN_BACKEND_HOST,
+        "x-original-host": "bob.divine.video",
+        authorization: "Nostr abc",
+      },
+    }),
+    response: new Response("<html></html>", {
+      status: 200,
+      headers: { "cache-control": "public, max-age=60" },
+    }),
+  });
+  assertEquals(authProfile.headers.get("cdn-cache-control"), "no-store");
+  assertEquals(authProfile.headers.get("cache-control"), "private, no-store");
+
+  // A forged rewritten-looking request (backend host, X-Original-Host) without the
+  // router's per-isolate marker is not trusted either.
+  const forged = await onOriginResponse({
+    request: new Request(`https://${FUNNELCAKE_BACKEND_HOST}/api/videos`, {
+      headers: {
+        host: "api.divine.video",
+        "x-original-host": "bob.divine.video",
+        "x-divine-router-hop": "guess",
+        authorization: "Nostr abc",
+      },
+    }),
+    response: new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=10" } }),
+  });
+  assertEquals(forged.headers.get("cache-control"), "private, no-store");
+
+  // The request onOriginRequest actually built is trusted.
+  const built = await onOriginRequest({
+    request: new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video", "x-original-host": "evil.example" },
+    }),
+  }) as Request;
+  assertEquals(built.headers.get("x-original-host"), "api.divine.video");
+  const rewritten = await onOriginResponse({
+    request: built,
+    response: new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=10" } }),
+  });
+  assertEquals(
+    rewritten.headers.get("cdn-cache-control"),
+    `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+});
+
+Deno.test("standalone proxy keeps Content-Encoding consistent with what real fetch returns", async () => {
+  const { brotliCompressSync, gzipSync } = await import("node:zlib");
+  const raw = new TextEncoder().encode(JSON.stringify({ videos: ["a".repeat(512)] }));
+  const origin = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, (req) => {
+    const ae = req.headers.get("accept-encoding") ?? "";
+    const coding = ae.includes("br") ? "br" : ae.includes("gzip") ? "gzip" : null;
+    const body = new Uint8Array(
+      coding === "br" ? brotliCompressSync(raw) : coding === "gzip" ? gzipSync(raw) : raw,
+    );
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "content-length": String(body.length),
+      "cache-control": "public, max-age=10",
+    };
+    if (coding) headers["content-encoding"] = coding;
+    return new Response(body, { headers });
+  });
+  try {
+    const handler = createRouterHandler({
+      backendUrls: {
+        funnelcake_api: `http://127.0.0.1:${origin.addr.port}`,
+        main_site: `http://127.0.0.1:${origin.addr.port}`,
+      },
+      usernameStore: new MemoryUsernameStore({ alice: { pubkey: "pk", status: "active" } }),
+    });
+    const cases: Array<[string, string | null]> = [
+      ["api.divine.video", "gzip"],
+      ["api.divine.video", "br"],
+      ["api.divine.video", "gzip, deflate, br, zstd"],
+      ["api.divine.video", null],
+      ["api.divine.video", "identity"],
+      ["alice.divine.video", "gzip"],
+      ["alice.divine.video", "br"],
+    ];
+    for (const [host, ae] of cases) {
+      const headers: Record<string, string> = { host };
+      if (ae) headers["accept-encoding"] = ae;
+      const resp = await handler(new Request(`https://${host}/api/videos`, { headers }));
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const ce = resp.headers.get("content-encoding");
+      const decoded = ce === null || ce === "identity" ? bytes : null;
+      assertEquals(ce, null, `${host} ${ae}: content-encoding must match the decoded body`);
+      assertEquals(new TextDecoder().decode(decoded!), new TextDecoder().decode(raw), `${host} ${ae}`);
+      const cl = resp.headers.get("content-length");
+      if (cl !== null) assertEquals(Number(cl), bytes.length, `${host} ${ae}: content-length`);
+    }
+  } finally {
+    await origin.shutdown();
+  }
+});
+
+Deno.test("API stale-if-error pin overrides an origin-supplied stale-if-error at the edge", async () => {
+  const handler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=10, stale-if-error=60" },
+        }),
+      ),
+  });
+  const resp = await handler(
+    new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
+  );
+  assertEquals(resp.headers.get("cache-control"), "public, max-age=10, stale-if-error=60");
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+});
+
+Deno.test("a configured hop token is honored across middleware instances (separate isolates)", async () => {
+  const requestSide = createPullZoneMiddleware({ hopToken: "shared-secret" });
+  const responseSide = createPullZoneMiddleware({ hopToken: "shared-secret" });
+  const built = await requestSide.onOriginRequest({
+    request: new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video" },
+    }),
+  }) as Request;
+  const resp = await responseSide.onOriginResponse({
+    request: built,
+    response: new Response("{}", { status: 200, headers: { "cache-control": "public, max-age=10" } }),
+  });
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
 });

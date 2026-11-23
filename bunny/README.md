@@ -52,7 +52,7 @@ curl -H 'Host: api.divine.video' http://127.0.0.1:8787/api/videos
      - Bypass cache for the sound proxy routes (`/api/sounds/providers`, `/api/sounds/trending`, `/api/sounds/*/videos`).
      - Bypass cache for short links (`/l`, `/l/*`, `/api/links`, `/api/links/*` on `divine.video` and `www.divine.video`).
      - Bypass cache for non-`GET` methods (`POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`) and `HEAD`.
-4. **Before production without `PUBLIC_HOST_OVERRIDE`:** confirm on the real Bunny runtime that `onOriginRequest` sees the client's `Host` header and that `onOriginResponse` receives the rewritten origin request (the one carrying the router-set `X-Original-Host`). The SDK's local emulation behaves this way, but the hosted runtime has not been checked.
+4. **Before production without `PUBLIC_HOST_OVERRIDE`:** confirm on the real Bunny runtime that `onOriginRequest` sees the client's `Host` header and that `onOriginResponse` receives the rewritten origin request (the one carrying the router-set `X-Original-Host`). The SDK's local emulation behaves this way, but the hosted runtime has not been checked. Set `ROUTER_HOP_TOKEN` (a random secret, set in the Bunny dashboard rather than on the `deploy_bunny.py` command line) so the hop marker matches even if the two hooks run in different isolates; without it, a mismatch fails closed and silently turns off API caching. Run the probe against the Pull Zone afterwards: its `Accept-Encoding` dedup check requires cache `HIT`s, so it fails if API caching is off.
 5. **Optional Phase 2 (`divine.video` + `*.divine.video`):**
    - Provision a replicated **Bunny Database** (`usernames` table) and set `BUNNY_DB_URL` + `BUNNY_DB_TOKEN`.
    - Sync writes from `divine-name-server` into Bunny Database alongside Fastly KV during migration.
@@ -70,6 +70,25 @@ python3 bunny/deploy_bunny.py --name divine-router-api-middleware --mode middlew
 ```
 
 The script upserts the Edge Script, its variables and code, publishes it, then applies the Pull Zone settings and Edge Rules above.
+
+## Deliberate differences from Fastly
+
+These are intentional and covered by `bunny/src/router_test.ts`:
+
+- **Cache directives.** The 30s API fallback TTL and the `stale-if-error` pin go into `CDN-Cache-Control`. The fallback also sets `s-maxage` in the client-visible `Cache-Control` for shared caches without changing browser `max-age`. `Surrogate-Control` is stripped, as Fastly does; its TTL can also be copied into `s-maxage`.
+- **Fallback statuses.** The fallback TTL applies only to 200, 203, 204, 206, 300, 301, 404 and 410. Fastly's hook runs for every non-5xx; here 400, 401, 403, 429 and 302 are never given a TTL.
+- **Uncacheable wins over Surrogate-Control.** An origin `Cache-Control: private`, `no-store` or `no-cache` is never stored, even when `Surrogate-Control` sets a TTL.
+- **Set-Cookie.** A response that sets a cookie gets `no-store` in both `Cache-Control` and `CDN-Cache-Control`, even if the origin marked it public.
+- **Pass routes.** Pass responses get `Cache-Control: no-store` (`private, no-store` with `Authorization`) and `CDN-Cache-Control: no-store`, so neither Bunny nor a downstream cache keeps them. Fastly's pass leaves the client header alone.
+- **Authenticated requests in middleware mode.** Any response to a request with `Authorization` is marked `private, no-store`, matching the Pull Zone Edge Rule. Standalone mode keeps `src/main.rs` behavior (non-API routes stay cacheable per origin headers); behind a Pull Zone the same Edge Rule applies the stamp there too.
+- **Stale-if-error pin.** On API and RSS routes the 24h `stale-if-error` replaces any origin value in `CDN-Cache-Control`, as Fastly's `set_stale_if_error` does.
+- **Standalone decompression.** Deno's `fetch` decodes gzip and br bodies (unless the upstream `Accept-Encoding` is exactly `identity`) but keeps `Content-Encoding` and the compressed `Content-Length`. The Standalone handler drops both so clients get a correctly labelled body, which the serving layer may re-compress. Confirm on Bunny's runtime before relying on Standalone mode; `fetchDecodesBodies: false` turns this off.
+
+## Known limitations
+
+- `UseStaleWhileOffline` is zone-wide. Non-API routes opt out with `stale-if-error=0` in `CDN-Cache-Control`; whether Bunny honors that header-level opt-out is unverified.
+- `deploy_bunny.py --env KEY=VALUE` puts values in the process argument list. Pass secrets such as `BUNNY_DB_TOKEN` through the Bunny dashboard or an environment-scoped secret instead.
+- Phase 2 username lookups: a Bunny Database outage makes each lookup wait up to the 5s timeout and then 404, and a missing `BUNNY_DB_URL`/`BUNNY_DB_TOKEN` silently uses an empty store. Add backoff and a startup check before enabling username routes on Bunny.
 
 ## A/B Benchmarking Against Fastly
 

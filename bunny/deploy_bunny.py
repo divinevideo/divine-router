@@ -115,7 +115,7 @@ def upsert_env_vars(client: BunnyClient, script_id: int, env_vars: Dict[str, str
             client.request(
                 "POST",
                 f"/compute/script/{script_id}/variables/{var_id}",
-                {"Name": k, "Required": False, "DefaultValue": v},
+                {"DefaultValue": v},
             )
         else:
             client.request(
@@ -142,7 +142,7 @@ def configure_api_pull_zone(
         "EnableCacheSlice": False,
         "CacheControlMaxAgeOverride": -1,  # Respect origin Cache-Control
         "CacheControlPublicMaxAgeOverride": -1,
-        "EnableWebSocket": True,
+        "EnableWebSockets": True,
         "EnableHostnameVary": True,
         "EnableCountryCodeVary": False,
         "DisableCookies": False,
@@ -271,10 +271,15 @@ def configure_api_pull_zone(
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
                         "*://*/v1/account/moderation-status",
+                        "*://*/v1/account/moderation-status?*",
                         "*://*/v1/minor-review-cases/greenlight",
+                        "*://*/v1/minor-review-cases/greenlight?*",
                         "*://*/v1/minor-review-cases/*/parent-contact",
+                        "*://*/v1/minor-review-cases/*/parent-contact?*",
                         "*://*/v1/minor-review-cases/*/parent-consent",
+                        "*://*/v1/minor-review-cases/*/parent-consent?*",
                         "*://*/api/zendesk/pre-auth",
+                        "*://*/api/zendesk/pre-auth?*",
                     ],
                 },
             ],
@@ -291,8 +296,10 @@ def configure_api_pull_zone(
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
                         "*://divine.video/l",
+                        "*://divine.video/l?*",
                         "*://divine.video/l/*",
                         "*://www.divine.video/l",
+                        "*://www.divine.video/l?*",
                         "*://www.divine.video/l/*",
                     ],
                 },
@@ -310,8 +317,10 @@ def configure_api_pull_zone(
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
                         "*://divine.video/api/links",
+                        "*://divine.video/api/links?*",
                         "*://divine.video/api/links/*",
                         "*://www.divine.video/api/links",
+                        "*://www.divine.video/api/links?*",
                         "*://www.divine.video/api/links/*",
                     ],
                 },
@@ -416,7 +425,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         script = client.request("POST", "/compute/script", payload)
         print(f"Created Edge Script id={script['Id']} name={script['Name']} type={script.get('ScriptType')}")
     else:
-        print(f"Reusing Edge Script id={script['Id']} name={script['Name']} type={script.get('ScriptType')}")
+        expected_type = SCRIPT_TYPE_MAP[args.mode]
+        actual_type = script.get("ScriptType")
+        if actual_type is not None and int(actual_type) != expected_type:
+            print(
+                f"error: Edge Script {args.name!r} has ScriptType={actual_type}, "
+                f"but --mode {args.mode} expects {expected_type}; refusing to overwrite it",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"Reusing Edge Script id={script['Id']} name={script['Name']} type={actual_type}")
 
     script_id = int(script["Id"])
     upsert_env_vars(client, script_id, env_vars)
