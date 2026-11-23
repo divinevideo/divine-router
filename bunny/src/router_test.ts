@@ -56,6 +56,7 @@ import {
   BunnyDatabaseUsernameStore,
   lookupUsernameWithFallback,
   MemoryUsernameStore,
+  NameServerUsernameStore,
 } from "./username_store.ts";
 
 function makeActiveUser(pubkey: string, relays: string[] = []): UsernameData {
@@ -1167,4 +1168,85 @@ Deno.test("a configured hop token is honored across middleware instances (separa
     resp.headers.get("cdn-cache-control"),
     `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
   );
+});
+
+Deno.test("NameServerUsernameStore resolves /api/username/lookup/:name, falls back to nostr.json on non-JSON 404, and skips caching 5xx", async () => {
+  let calls = 0;
+  const mockFetch: typeof fetch = (input) => {
+    calls += 1;
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.endsWith("/api/username/lookup/alice")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            pubkey: "pk-alice",
+            relays: ["wss://relay.divine.video"],
+            status: "active",
+            atproto_did: "did:plc:alice123",
+            atproto_state: "ready",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
+    if (url.endsWith("/api/username/lookup/missing")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ ok: false, error: "Not found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    if (url.endsWith("/api/username/lookup/legacy")) {
+      return Promise.resolve(new Response("404 Not Found", { status: 404, headers: { "content-type": "text/plain" } }));
+    }
+    if (url.endsWith("/.well-known/nostr.json?name=legacy")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            names: { legacy: "pk-legacy" },
+            relays: { "pk-legacy": ["wss://relay.divine.video"] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
+    return Promise.resolve(new Response("upstream error", { status: 503 }));
+  };
+
+  const store = new NameServerUsernameStore("https://names.divine.video", 60_000, mockFetch);
+
+  // Active hit cached across repeated lookups
+  const alice1 = await store.lookup("Alice");
+  const alice2 = await store.lookup("alice");
+  assertEquals(calls, 1);
+  assertEquals(alice1, {
+    pubkey: "pk-alice",
+    relays: ["wss://relay.divine.video"],
+    status: "active",
+    atproto_did: "did:plc:alice123",
+    atproto_state: "ready",
+  });
+  assertEquals(alice2, alice1);
+
+  // Authoritative JSON 404 caches negative result without fallback call
+  assertEquals(await store.lookup("missing"), null);
+  assertEquals(await store.lookup("missing"), null);
+  assertEquals(calls, 2);
+
+  // Plain-text 404 falls back to /.well-known/nostr.json
+  const legacy = await store.lookup("legacy");
+  assertEquals(legacy, {
+    pubkey: "pk-legacy",
+    relays: ["wss://relay.divine.video"],
+    status: "active",
+    atproto_did: null,
+    atproto_state: null,
+  });
+  assertEquals(calls, 4);
+
+  // 5xx errors are never negatively cached
+  assertEquals(await store.lookup("flaky"), null);
+  assertEquals(await store.lookup("flaky"), null);
+  assertEquals(calls, 6);
 });
