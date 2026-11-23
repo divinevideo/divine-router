@@ -75,7 +75,7 @@ The script upserts the Edge Script, its variables and code, publishes it, then a
 
 These are intentional and covered by `bunny/src/router_test.ts`:
 
-- **Edge-only cache directives.** The 30s API fallback TTL and the `stale-if-error` pin go into `CDN-Cache-Control` (plus a shared-cache `s-maxage` for the fallback). The client's `Cache-Control` stays as the origin sent it, and `Surrogate-Control` is stripped, as Fastly does.
+- **Cache directives.** The 30s API fallback TTL and the `stale-if-error` pin go into `CDN-Cache-Control`. The fallback also sets `s-maxage` in the client-visible `Cache-Control` for shared caches without changing browser `max-age`. `Surrogate-Control` is stripped, as Fastly does; its TTL can also be copied into `s-maxage`.
 - **Fallback statuses.** The fallback TTL applies only to 200, 203, 204, 206, 300, 301, 404 and 410. Fastly's hook runs for every non-5xx; here 400, 401, 403, 429 and 302 are never given a TTL.
 - **Uncacheable wins over Surrogate-Control.** An origin `Cache-Control: private`, `no-store` or `no-cache` is never stored, even when `Surrogate-Control` sets a TTL.
 - **Set-Cookie.** A response that sets a cookie gets `no-store` in both `Cache-Control` and `CDN-Cache-Control`, even if the origin marked it public.

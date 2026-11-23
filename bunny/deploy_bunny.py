@@ -111,13 +111,13 @@ def upsert_env_vars(client: BunnyClient, script_id: int, env_vars: Dict[str, str
             client.request(
                 "POST",
                 f"/compute/script/{script_id}/variables/{var_id}",
-                {"Name": k, "Value": v, "Required": False, "DefaultValue": ""},
+                {"DefaultValue": v},
             )
         else:
             client.request(
                 "POST",
                 f"/compute/script/{script_id}/variables/add",
-                {"Name": k, "Value": v, "Required": False, "DefaultValue": ""},
+                {"Name": k, "Required": False, "DefaultValue": v},
             )
 
 
@@ -138,7 +138,7 @@ def configure_api_pull_zone(
         "EnableCacheSlice": False,
         "CacheControlMaxAgeOverride": -1,  # Respect origin Cache-Control
         "CacheControlPublicMaxAgeOverride": -1,
-        "EnableWebSocket": True,
+        "EnableWebSockets": True,
         "EnableHostnameVary": True,
         "EnableCountryCodeVary": False,
         "DisableCookies": False,
