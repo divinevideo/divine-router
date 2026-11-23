@@ -110,8 +110,41 @@ class LocalHttpProbeTests(unittest.TestCase):
             self.assertEqual(report.auth_bypass_cache_status, "BYPASS")
             self.assertEqual(report.cold_miss_cache_status, "MISS")
             self.assertEqual(len(report.encoding_variants), 4)
+            self.assertTrue(report.encoding_dedup_ok)
         finally:
             session.close()
+
+    def test_encoding_dedup_fails_when_cache_fragments_by_accept_encoding(self):
+        class FragmentingHandler(http.server.BaseHTTPRequestHandler):
+            seen = set()
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                key = (self.path, self.headers.get("Accept-Encoding", ""))
+                state = "HIT" if key in FragmentingHandler.seen else "MISS"
+                FragmentingHandler.seen.add(key)
+                body = b'{"videos":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("CDN-Cache", "BYPASS" if self.headers.get("Authorization") else state)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FragmentingHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        session = probe.EdgeSession(f"http://127.0.0.1:{srv.server_address[1]}", timeout=5.0, reuse=True)
+        try:
+            report = probe.run_contract_checks(session, "local", "test", "/api/videos")
+            self.assertTrue(report.auth_bypass_ok)
+            self.assertFalse(report.encoding_dedup_ok)
+        finally:
+            session.close()
+            srv.shutdown()
+            srv.server_close()
 
     def test_auth_bypass_fails_closed_when_cache_header_missing(self):
         class NoCacheHeaderHandler(http.server.BaseHTTPRequestHandler):
@@ -134,6 +167,7 @@ class LocalHttpProbeTests(unittest.TestCase):
             report = probe.run_contract_checks(session, "local", "test", "/api/videos")
             self.assertFalse(report.auth_bypass_ok)
             self.assertIsNone(report.auth_bypass_cache_status)
+            self.assertFalse(report.encoding_dedup_ok)
         finally:
             session.close()
             srv.shutdown()

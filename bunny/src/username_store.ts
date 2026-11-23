@@ -1,5 +1,5 @@
 // ABOUTME: Username store abstraction for Bunny Edge Scripting (NIP-05, WebFinger, ATProto DID, profiles).
-// ABOUTME: Supports in-memory fixtures (tests/dev), Bunny Database HTTP (libSQL), and divine-name-server fallback.
+// ABOUTME: Supports in-memory fixtures (tests/dev) and Bunny Database over the libSQL HTTP pipeline API.
 
 import type { UsernameData } from "./router.ts";
 

@@ -129,13 +129,18 @@ function buildUpstreamHeaders(
 
 const CACHEABLE_FALLBACK_STATUSES = new Set([200, 203, 204, 206, 300, 301, 404, 410]);
 
-function replaceOrAppendStaleIfError(headerValue: string, seconds: number): string {
+function replaceOrAppendDirective(headerValue: string, directive: string, seconds: number): string {
+  const existing = new RegExp(`^${directive}(?:\\s*=|$)`, "i");
   const cleaned = headerValue
     .split(",")
     .map((part) => part.trim())
-    .filter((part) => part.length > 0 && !/^stale-if-error(?:\s*=|$)/i.test(part));
-  cleaned.push(`stale-if-error=${seconds}`);
+    .filter((part) => part.length > 0 && !existing.test(part));
+  cleaned.push(`${directive}=${seconds}`);
   return cleaned.join(", ");
+}
+
+function replaceOrAppendStaleIfError(headerValue: string, seconds: number): string {
+  return replaceOrAppendDirective(headerValue, "stale-if-error", seconds);
 }
 
 /**
@@ -219,15 +224,23 @@ export function applyResponseCachePolicy(
   }
 
   if (action.kind === "SetFallbackTtl" && CACHEABLE_FALLBACK_STATUSES.has(response.status)) {
+    // Fastly's fallback (`candidate.set_ttl` in src/main.rs) only changes the edge
+    // TTL; clients keep the origin's Cache-Control. Put the fallback in
+    // CDN-Cache-Control and a shared-cache-only s-maxage, never in max-age.
     const directives = ["public", `max-age=${action.ttlSecs}`];
     if (sieSecs !== null) {
       directives.push(`stale-if-error=${sieSecs}`);
     }
-    const ccValue = directives.join(", ");
-    headers.set("cache-control", ccValue);
     if (!headers.has("cdn-cache-control")) {
-      headers.set("cdn-cache-control", ccValue);
+      headers.set("cdn-cache-control", directives.join(", "));
     }
+    const existingCc = headers.get("cache-control");
+    headers.set(
+      "cache-control",
+      existingCc
+        ? replaceOrAppendDirective(existingCc, "s-maxage", action.ttlSecs)
+        : `s-maxage=${action.ttlSecs}`,
+    );
   } else if (!isServerError && sieSecs !== null) {
     const existingCc = headers.get("cache-control");
     if (sieSecs === 0) {

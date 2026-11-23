@@ -497,10 +497,49 @@ Deno.test("end-to-end standalone handler: API proxy, Accept-Encoding, fallback T
   assertEquals(capturedHeaders!.get("host"), FUNNELCAKE_BACKEND_HOST);
   assertEquals(capturedHeaders!.get("x-original-host"), "api.divine.video");
   assertEquals(capturedHeaders!.get("accept-encoding"), "br");
+  // Fastly's fallback only sets the edge TTL. Clients must not be told to cache:
+  // the fallback goes to CDN-Cache-Control plus a shared-cache-only s-maxage.
+  assertEquals(resp.headers.get("cache-control"), "s-maxage=30");
   assertEquals(
-    resp.headers.get("cache-control"),
+    resp.headers.get("cdn-cache-control"),
     `public, max-age=30, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
   );
+});
+
+Deno.test("fallback TTL preserves origin browser Cache-Control (max-age=0 stays max-age=0)", async () => {
+  const handler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "max-age=0, must-revalidate" },
+        }),
+      ),
+  });
+  const resp = await handler(
+    new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video" },
+    }),
+  );
+  assertEquals(resp.headers.get("cache-control"), "max-age=0, must-revalidate, s-maxage=30");
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    `public, max-age=30, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+  );
+
+  // An origin s-maxage=0 is replaced, not duplicated.
+  const sZeroHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", { status: 404, headers: { "cache-control": "max-age=5, s-maxage=0" } }),
+      ),
+  });
+  const sZeroResp = await sZeroHandler(
+    new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video" },
+    }),
+  );
+  assertEquals(sZeroResp.headers.get("cache-control"), "max-age=5, s-maxage=30");
 });
 
 Deno.test("end-to-end standalone handler: authenticated API request bypasses cache and keeps Accept-Encoding", async () => {

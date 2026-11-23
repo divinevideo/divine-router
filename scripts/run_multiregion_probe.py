@@ -195,8 +195,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     any_probe_failed = False
     print("\n=== Multi-Region Router Benchmark Summary ===")
-    print(f"{'Region':<12} {'Edge':<18} {'Conn':>6} {'p50':>7} {'p95':>7} {'ColdMiss':>9} {'Auth':>6} {'Err':>4}  Verdict")
-    print("-" * 88)
+    print(f"{'Region':<12} {'Edge':<18} {'Conn':>6} {'p50':>7} {'p95':>7} {'ColdMiss':>9} {'Auth':>6} {'AE':>5} {'Err':>4}  Verdict")
+    print("-" * 94)
     for region, _zone in DEFAULT_ZONES:
         if region in errors:
             print(f"{region:<12} ERROR: {errors[region]}")
@@ -212,10 +212,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             c = contracts.get(edge_name) or {}
             cold = f"{c['cold_miss_ttfb_ms']:.0f}ms" if c.get("cold_miss_ttfb_ms") is not None else "-"
             auth = "OK" if c.get("auth_bypass_ok") is True else ("FAIL" if c.get("auth_bypass_ok") is False else "-")
+            ae = "OK" if c.get("encoding_dedup_ok") is True else ("FAIL" if c.get("encoding_dedup_ok") is False else "-")
             verdict = "baseline" if edge_name == args.baseline else verdicts.get(edge_name, {}).get("verdict", "-")
-            if edge_name != args.baseline and (verdict != "PASS" or c.get("auth_bypass_ok") is not True):
+            if edge_name != args.baseline and (
+                verdict != "PASS"
+                or c.get("auth_bypass_ok") is not True
+                or c.get("encoding_dedup_ok") is not True
+            ):
                 any_probe_failed = True
-            print(f"{region:<12} {edge_name:<18} {conn:>6} {p50:>7} {p95:>7} {cold:>9} {auth:>6} {s.get('errors', 0):>4}  {verdict}")
+            print(f"{region:<12} {edge_name:<18} {conn:>6} {p50:>7} {p95:>7} {cold:>9} {auth:>6} {ae:>5} {s.get('errors', 0):>4}  {verdict}")
 
     if args.json:
         with open(args.json, "w") as fh:

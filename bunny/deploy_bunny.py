@@ -34,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 API_BASE = "https://api.bunny.net"
 DEFAULT_KEY_PATH = Path.home() / ".config" / "divine-cdn" / "bunny-api-key"
 
-SCRIPT_TYPE_STANDALONE = 1  # Verified against live Bunny API below if 0 fails
 SCRIPT_TYPE_MAP = {
     "standalone": 1,
     "middleware": 2,

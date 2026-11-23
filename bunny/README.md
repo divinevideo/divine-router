@@ -44,14 +44,32 @@ curl -H 'Host: api.divine.video' http://127.0.0.1:8787/api/videos
    - **Serve Stale:** Enable `UseStaleWhileUpdating` (`stale-while-revalidate`) and `UseStaleWhileOffline` (`stale-if-error`).
    - **Request Coalescing:** Enable to collapse concurrent cache misses against ClickHouse.
    - **Cache-Control / Smart Cache:** Honor origin `Cache-Control` / `CDN-Cache-Control` for `application/json` (do not restrict caching to static extensions).
-   - **Edge Rules (pre-cache bypasses, essential for Middleware mode):**
-     - Bypass cache when `Authorization` request header is present.
-     - Bypass cache for `/.well-known/*`, `/api/docs*`, `/v1/*`, `/api/zendesk/*`, `/api/sounds/providers`, `/api/sounds/trending`, `/api/sounds/*/videos`.
-     - Bypass cache for non-`GET` methods (`POST`, `PUT`, `DELETE`, `OPTIONS`).
-4. **Optional Phase 2 (`divine.video` + `*.divine.video`):**
+   - **Edge Rules (pre-cache bypasses, essential for Middleware mode):** `bunny/deploy_bunny.py` creates and reconciles these (rules prefixed `divine-router:`); the script is the source of truth.
+     - Bypass cache when the `Authorization` request header is present, and mark those responses `Cache-Control: private, no-store`.
+     - Bypass cache for candidate hosts (`api2.divine.video`, `relay2.divine.video`).
+     - Bypass cache for `/.well-known/*`, `/ap`, `/ap/*`, `/nodeinfo`, `/nodeinfo/*`, `/api/docs*`.
+     - Bypass cache for the exact mobile API routes (`/v1/account/moderation-status`, `/v1/minor-review-cases/greenlight`, `/v1/minor-review-cases/*/parent-contact`, `/v1/minor-review-cases/*/parent-consent`, `/api/zendesk/pre-auth`).
+     - Bypass cache for the sound proxy routes (`/api/sounds/providers`, `/api/sounds/trending`, `/api/sounds/*/videos`).
+     - Bypass cache for short links (`/l`, `/l/*`, `/api/links`, `/api/links/*` on `divine.video` and `www.divine.video`).
+     - Bypass cache for non-`GET` methods (`POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`) and `HEAD`.
+4. **Before production without `PUBLIC_HOST_OVERRIDE`:** confirm on the real Bunny runtime that `onOriginRequest` sees the client's `Host` header and that `onOriginResponse` receives the rewritten origin request (the one carrying the router-set `X-Original-Host`). The SDK's local emulation behaves this way, but the hosted runtime has not been checked.
+5. **Optional Phase 2 (`divine.video` + `*.divine.video`):**
    - Provision a replicated **Bunny Database** (`usernames` table) and set `BUNNY_DB_URL` + `BUNNY_DB_TOKEN`.
    - Sync writes from `divine-name-server` into Bunny Database alongside Fastly KV during migration.
    - For wildcard `*.divine.video` TLS while DNS remains on Cloudflare, automate ACME DNS-01 cert upload via the Bunny Pull Zone API (or move DNS to Bunny DNS for native wildcard Let's Encrypt).
+
+### Deploying
+
+Bundle, then deploy with `bunny/deploy_bunny.py` (reads `BUNNY_API_KEY` or `~/.config/divine-cdn/bunny-api-key`; never prints it):
+
+```bash
+cd bunny && deno task bundle && deno task bundle:middleware && cd ..
+python3 bunny/deploy_bunny.py --name divine-router-api-middleware --mode middleware \
+  --bundle bunny/dist/middleware.js --origin https://relay.divine.video \
+  --env PUBLIC_HOST_OVERRIDE=api.divine.video
+```
+
+The script upserts the Edge Script, its variables and code, publishes it, then applies the Pull Zone settings and Edge Rules above.
 
 ## A/B Benchmarking Against Fastly
 
@@ -72,5 +90,6 @@ python3 scripts/probe_router_edge.py \
 The probe measures and verifies:
 - Separate DNS+TCP+TLS connect time vs. established-connection p50/p95/p99 TTFB.
 - `Accept-Encoding` cache fragmentation across `br`, Chrome (`gzip, deflate, br, zstd`), Dart (`gzip`), and `gzip, deflate`.
-- `Authorization` header cache bypass (`BYPASS` / `MISS`, never `HIT`).
+- `Authorization` header cache bypass (`BYPASS` / `MISS`, never `HIT`; a missing cache-status header fails).
+- The probe exits non-zero when a non-baseline edge fails the latency verdict, the `Authorization` check, or the `Accept-Encoding` dedup check (every variant must be a cache `HIT`).
 - Cold cache miss latency and JSON payload shape parity against Fastly.

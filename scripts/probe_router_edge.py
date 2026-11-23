@@ -103,6 +103,7 @@ class EncodingCheckResult:
 class ContractCheckReport:
     edge: str
     encoding_variants: List[EncodingCheckResult] = field(default_factory=list)
+    encoding_dedup_ok: Optional[bool] = None
     auth_bypass_cache_status: Optional[str] = None
     auth_bypass_ok: Optional[bool] = None
     cold_miss_ttfb_ms: Optional[float] = None
@@ -417,6 +418,14 @@ def run_contract_checks(
             )
         )
 
+    # Every client variant must be served from the object warmed above. A
+    # missing cache-status header or any non-HIT means Accept-Encoding still
+    # fragments the cache (or cannot be verified), so fail closed.
+    report.encoding_dedup_ok = bool(report.encoding_variants) and all(
+        ev.error is None and is_cache_hit(ev.cache_status)
+        for ev in report.encoding_variants
+    )
+
     # 2. Verify Authorization header bypasses shared cache
     auth_sample, _ = session.fetch(
         path,
@@ -577,7 +586,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if report.auth_bypass_ok is not None
                 else "n/a"
             )
-            print(f"  {name}: shape={shape}  cold_miss={cold}  auth_bypass={auth}")
+            dedup = "n/a" if report.encoding_dedup_ok is None else ("OK" if report.encoding_dedup_ok else "FAIL")
+            print(f"  {name}: shape={shape}  cold_miss={cold}  auth_bypass={auth}  ae_dedup={dedup}")
             for ev in report.encoding_variants:
                 print(
                     f"    AE[{ev.label:<12}] status={ev.status} ce={ev.content_encoding or '-':<4} "
@@ -600,7 +610,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\nwrote {args.json}", file=sys.stderr)
 
     contracts_ok = all(
-        report.auth_bypass_ok is True
+        report.auth_bypass_ok is True and report.encoding_dedup_ok is True
         for name, report in contracts.items()
         if name != args.baseline
     )
