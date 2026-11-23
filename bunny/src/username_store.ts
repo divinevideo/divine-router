@@ -1,5 +1,5 @@
 // ABOUTME: Username store abstraction for Bunny Edge Scripting (NIP-05, WebFinger, ATProto DID, profiles).
-// ABOUTME: Supports in-memory fixtures (tests/dev) and Bunny Database over the libSQL HTTP pipeline API.
+// ABOUTME: Supports in-memory fixtures (tests/dev), Bunny Database (libSQL HTTP), and divine-name-server HTTP lookup.
 
 import type { UsernameData } from "./router.ts";
 
@@ -134,6 +134,7 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
       });
 
       if (!resp.ok) {
+        void resp.body?.cancel().catch(() => {});
         return null;
       }
 
@@ -189,16 +190,151 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
   }
 }
 
+/**
+ * Reads username routing metadata directly from divine-name-server over HTTP
+ * (`GET /api/username/lookup/:name`) with an automatic fallback to
+ * `/.well-known/nostr.json?name=:name` if the lookup endpoint is not deployed yet,
+ * backed by a bounded in-isolate TTL cache.
+ */
+export class NameServerUsernameStore implements UsernameStore {
+  private readonly cache = new Map<string, { value: UsernameData | null; expiresAt: number }>();
+
+  constructor(
+    private readonly baseUrl: string,
+    private readonly ttlMs = 30_000,
+    private readonly fetcher: typeof fetch = fetch,
+    private readonly maxCacheEntries = 10_000,
+    private readonly timeoutMs = 5_000,
+  ) {}
+
+  private setCache(key: string, value: UsernameData | null, expiresAt: number): void {
+    if (this.cache.size >= this.maxCacheEntries && !this.cache.has(key)) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      }
+    }
+    this.cache.set(key, { value, expiresAt });
+  }
+
+  private async fallbackNip05Lookup(base: string, key: string, now: number): Promise<UsernameData | null> {
+    const resp = await this.fetcher(
+      `${base}/.well-known/nostr.json?name=${encodeURIComponent(key)}`,
+      {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      },
+    );
+    if (!resp.ok) {
+      void resp.body?.cancel().catch(() => {});
+      return null;
+    }
+    const payload = await resp.json() as {
+      names?: Record<string, string>;
+      relays?: Record<string, string[]>;
+    };
+    const names = payload?.names;
+    if (!names || typeof names !== "object") {
+      return null;
+    }
+    const matchedEntry = Object.entries(names).find(([k]) => k.toLowerCase() === key);
+    if (!matchedEntry || typeof matchedEntry[1] !== "string" || matchedEntry[1].length === 0) {
+      this.setCache(key, null, now + this.ttlMs);
+      return null;
+    }
+    const pubkey = matchedEntry[1];
+    const rawRelays = payload.relays?.[pubkey];
+    const relays = Array.isArray(rawRelays)
+      ? rawRelays.filter((r): r is string => typeof r === "string")
+      : [];
+    const record: UsernameData = {
+      pubkey,
+      relays,
+      status: "active",
+      atproto_did: null,
+      atproto_state: null,
+    };
+    this.setCache(key, record, now + this.ttlMs);
+    return record;
+  }
+
+  async lookup(username: string): Promise<UsernameData | null> {
+    const key = username.toLowerCase();
+    const now = Date.now();
+    const cached = this.cache.get(key);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+
+    const base = this.baseUrl.replace(/\/$/, "");
+    try {
+      const resp = await this.fetcher(
+        `${base}/api/username/lookup/${encodeURIComponent(key)}`,
+        {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(this.timeoutMs),
+        },
+      );
+
+      if (resp.status === 404) {
+        const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
+        void resp.body?.cancel().catch(() => {});
+        if (ct.includes("application/json")) {
+          this.setCache(key, null, now + this.ttlMs);
+          return null;
+        }
+        // Non-JSON 404 indicates /api/username/lookup/:name is not yet deployed;
+        // fall back to /.well-known/nostr.json for NIP-05/profile routing.
+        return await this.fallbackNip05Lookup(base, key, now);
+      }
+
+      if (!resp.ok) {
+        void resp.body?.cancel().catch(() => {});
+        return null;
+      }
+
+      const payload = await resp.json() as {
+        pubkey?: unknown;
+        relays?: unknown;
+        status?: unknown;
+        atproto_did?: unknown;
+        atproto_state?: unknown;
+      };
+      if (typeof payload.pubkey !== "string" || payload.pubkey.length === 0) {
+        return null;
+      }
+      const relays = Array.isArray(payload.relays)
+        ? payload.relays.filter((r): r is string => typeof r === "string")
+        : [];
+      const record: UsernameData = {
+        pubkey: payload.pubkey,
+        relays,
+        status: typeof payload.status === "string" ? payload.status : "active",
+        atproto_did: typeof payload.atproto_did === "string" ? payload.atproto_did : null,
+        atproto_state: typeof payload.atproto_state === "string" ? payload.atproto_state : null,
+      };
+      this.setCache(key, record, now + this.ttlMs);
+      return record;
+    } catch {
+      return null;
+    }
+  }
+}
+
 export function createUsernameStoreFromEnv(): UsernameStore {
+  const ttlMsRaw = Number.parseInt(Deno.env.get("USERNAME_CACHE_TTL_MS") ?? "30000", 10);
+  const ttlMs = Number.isFinite(ttlMsRaw) && ttlMsRaw >= 0 ? ttlMsRaw : 30_000;
+
   const dbUrl = Deno.env.get("BUNNY_DB_URL");
   const dbToken = Deno.env.get("BUNNY_DB_TOKEN");
   if (dbUrl && dbToken) {
-    const ttlMs = Number.parseInt(Deno.env.get("USERNAME_CACHE_TTL_MS") ?? "30000", 10);
-    return new BunnyDatabaseUsernameStore(
-      dbUrl,
-      dbToken,
-      Number.isFinite(ttlMs) && ttlMs >= 0 ? ttlMs : 30_000,
-    );
+    return new BunnyDatabaseUsernameStore(dbUrl, dbToken, ttlMs);
   }
+
+  const nameServerUrl = Deno.env.get("NAME_SERVER_URL");
+  if (nameServerUrl) {
+    return new NameServerUsernameStore(nameServerUrl, ttlMs);
+  }
+
   return new NullUsernameStore();
 }
