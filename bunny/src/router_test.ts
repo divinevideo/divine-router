@@ -12,7 +12,9 @@ import {
   BLOSSOM_BACKEND,
   buildAtprotoDidResponse,
   buildNip05Response,
+  buildUsernameNotFoundResponse,
   buildWebFingerJrd,
+  webFingerNotFoundResponse,
   CANDIDATE_API_BACKEND,
   CANDIDATE_BACKEND_HOST,
   candidateCacheAction,
@@ -744,9 +746,122 @@ Deno.test("security & cache-policy regression tests: private/no-store, Pass over
   assertEquals(webResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=0");
   assertEquals(webResp.headers.get("cdn-cache-control"), "public, max-age=60, stale-if-error=0");
 
-  // 5. ATProto DID responses carry cache-control: no-store
+  // 5. ATProto DID and dynamic 404 responses carry cache-control: no-store
   const didResp = buildAtprotoDidResponse(makeAtprotoUser("pk", "did:plc:abc123", "ready"));
   assertEquals(didResp.headers.get("cache-control"), "no-store");
+  assertEquals(webFingerNotFoundResponse().headers.get("cache-control"), "no-store");
+  assertEquals(buildUsernameNotFoundResponse("missing").headers.get("cache-control"), "no-store");
+
+  // 6. Non-Authorization Pass route (e.g. api2.divine.video) overwrites origin Cache-Control: public
+  const passPublicHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=10" },
+        }),
+      ),
+  });
+  const passPublicResp = await passPublicHandler(
+    new Request("https://api2.divine.video/api/videos", {
+      headers: { host: "api2.divine.video" },
+    }),
+  );
+  assertEquals(passPublicResp.headers.get("cache-control"), "no-store");
+  assertEquals(passPublicResp.headers.get("cdn-cache-control"), "no-store");
+
+  // 7. Surrogate-Control: no-store paired with Cache-Control: public forces uncacheable Cache-Control too
+  const surrogateNoStoreHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: {
+            "cache-control": "public, max-age=10",
+            "surrogate-control": "no-store",
+          },
+        }),
+      ),
+  });
+  const surrogateNoStoreResp = await surrogateNoStoreHandler(
+    new Request("https://api.divine.video/api/videos", {
+      headers: { host: "api.divine.video" },
+    }),
+  );
+  assertEquals(surrogateNoStoreResp.headers.get("cache-control"), "no-store");
+  assertEquals(surrogateNoStoreResp.headers.get("cdn-cache-control"), "no-store");
+
+  // 8. Uncacheable 4xx/3xx responses (429, 401, 403, 302) must NOT receive fallback public max-age=30
+  for (const status of [302, 400, 401, 403, 429]) {
+    const statusHandler = createRouterHandler({
+      fetcher: () => Promise.resolve(new Response("", { status })),
+    });
+    const statusResp = await statusHandler(
+      new Request("https://api.divine.video/api/videos", {
+        headers: { host: "api.divine.video" },
+      }),
+    );
+    assertEquals(statusResp.headers.get("cache-control"), null);
+    assertEquals(statusResp.headers.get("cdn-cache-control"), null);
+  }
+
+  // 9. Non-API cacheable route overrides origin stale-if-error=3600 down to stale-if-error=0
+  const overrideSieHandler = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response("<html></html>", {
+          status: 200,
+          headers: { "cache-control": "public, max-age=60, stale-if-error=3600" },
+        }),
+      ),
+  });
+  const overrideSieResp = await overrideSieHandler(
+    new Request("https://www.divine.video/", {
+      headers: { host: "www.divine.video" },
+    }),
+  );
+  assertEquals(overrideSieResp.headers.get("cache-control"), "public, max-age=60, stale-if-error=0");
+  assertEquals(overrideSieResp.headers.get("cdn-cache-control"), "public, max-age=60, stale-if-error=0");
+});
+
+Deno.test("BunnyDatabaseUsernameStore does not negative-cache HTTP 200 libSQL statement errors", async () => {
+  let calls = 0;
+  const mockFetch: typeof fetch = () => {
+    calls += 1;
+    if (calls === 1) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            results: [{ type: "error", error: { message: "SQLITE_BUSY" } }],
+          }),
+          { status: 200 },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          results: [
+            {
+              type: "ok",
+              response: {
+                result: {
+                  rows: [[{ value: "pk1" }, { value: "[]" }, { value: "active" }, { value: null }, { value: null }]],
+                },
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+  };
+
+  const store = new BunnyDatabaseUsernameStore("https://db.bunny.net", "tok", 60_000, mockFetch);
+  assertEquals(await store.lookup("alice"), null);
+  const recovered = await store.lookup("alice");
+  assertEquals(calls, 2);
+  assertEquals(recovered?.pubkey, "pk1");
 });
 
 Deno.test("BunnyDatabaseUsernameStore parses libSQL pipeline rows and caches hits", async () => {

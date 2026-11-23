@@ -32,6 +32,9 @@ class ProbeMathAndVerdictTests(unittest.TestCase):
         errored = probe.Summary("bunny", "us", n=10, errors=1, ttfb_p95_ms=15.0)
         self.assertEqual(probe.compare_to_baseline(errored, base, 20.0).verdict, "FAIL")
 
+        total_outage = probe.Summary("bunny", "us", n=10, errors=10, ttfb_p95_ms=None)
+        self.assertEqual(probe.compare_to_baseline(total_outage, base, 20.0).verdict, "FAIL")
+
         empty = probe.Summary("bunny", "us", n=0, errors=0, ttfb_p95_ms=None)
         self.assertEqual(probe.compare_to_baseline(empty, base, 20.0).verdict, "NO_DATA")
 
@@ -109,6 +112,32 @@ class LocalHttpProbeTests(unittest.TestCase):
             self.assertEqual(len(report.encoding_variants), 4)
         finally:
             session.close()
+
+    def test_auth_bypass_fails_closed_when_cache_header_missing(self):
+        class NoCacheHeaderHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                body = b'{"videos":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NoCacheHeaderHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        session = probe.EdgeSession(f"http://127.0.0.1:{srv.server_address[1]}", timeout=5.0, reuse=True)
+        try:
+            report = probe.run_contract_checks(session, "local", "test", "/api/videos")
+            self.assertFalse(report.auth_bypass_ok)
+            self.assertIsNone(report.auth_bypass_cache_status)
+        finally:
+            session.close()
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

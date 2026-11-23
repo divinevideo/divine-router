@@ -247,11 +247,11 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "https://*/.well-known/*",
-                        "https://*/ap",
-                        "https://*/ap/*",
-                        "https://*/nodeinfo",
-                        "https://*/api/docs*",
+                        "*://*/.well-known/*",
+                        "*://*/ap",
+                        "*://*/ap/*",
+                        "*://*/nodeinfo",
+                        "*://*/api/docs*",
                     ],
                 },
             ],
@@ -267,17 +267,17 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "https://*/v1/account/moderation-status",
-                        "https://*/v1/minor-review-cases/greenlight",
-                        "https://*/v1/minor-review-cases/*/parent-contact",
-                        "https://*/v1/minor-review-cases/*/parent-consent",
-                        "https://*/api/zendesk/pre-auth",
+                        "*://*/v1/account/moderation-status",
+                        "*://*/v1/minor-review-cases/greenlight",
+                        "*://*/v1/minor-review-cases/*/parent-contact",
+                        "*://*/v1/minor-review-cases/*/parent-consent",
+                        "*://*/api/zendesk/pre-auth",
                     ],
                 },
             ],
         },
         {
-            "Description": "divine-router: bypass cache for short links",
+            "Description": "divine-router: bypass cache for short links (/l)",
             "Enabled": True,
             "ActionType": 3,  # OverrideCacheTime
             "ActionParameter1": "0",
@@ -287,11 +287,29 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "https://divine.video/l",
-                        "https://divine.video/l/*",
-                        "https://www.divine.video/l",
-                        "https://www.divine.video/l/*",
-                        "https://divine.video/api/links*",
+                        "*://divine.video/l",
+                        "*://divine.video/l/*",
+                        "*://www.divine.video/l",
+                        "*://www.divine.video/l/*",
+                    ],
+                },
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for short links (/api/links)",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 0,  # Url
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": [
+                        "*://divine.video/api/links",
+                        "*://divine.video/api/links/*",
+                        "*://www.divine.video/api/links",
+                        "*://www.divine.video/api/links/*",
                     ],
                 },
             ],
@@ -307,11 +325,11 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "https://*/api/sounds/providers",
-                        "https://*/api/sounds/providers?*",
-                        "https://*/api/sounds/trending",
-                        "https://*/api/sounds/trending?*",
-                        "https://*/api/sounds/*/videos",
+                        "*://*/api/sounds/providers",
+                        "*://*/api/sounds/providers?*",
+                        "*://*/api/sounds/trending",
+                        "*://*/api/sounds/trending?*",
+                        "*://*/api/sounds/*/videos",
                     ],
                 },
             ],
@@ -327,8 +345,8 @@ def configure_api_pull_zone(
                     "Type": 0,  # Url
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
-                        "https://*/api/sounds/*/videos?*",
-                        "https://*/nodeinfo/*",
+                        "*://*/api/sounds/*/videos?*",
+                        "*://*/nodeinfo/*",
                     ],
                 },
             ],

@@ -139,6 +139,7 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
 
       const payload = await resp.json() as {
         results?: Array<{
+          type?: string;
           response?: {
             result?: {
               rows?: Array<Array<{ value?: string | null }>>;
@@ -147,7 +148,15 @@ export class BunnyDatabaseUsernameStore implements UsernameStore {
         }>;
       };
 
-      const row = payload.results?.[0]?.response?.result?.rows?.[0];
+      const firstResult = payload.results?.[0];
+      const rows = firstResult?.response?.result?.rows;
+      // libSQL Hrana returns HTTP 200 for per-statement SQL errors ({ type: "error" }).
+      // Never cache transient statement/schema errors as negative lookups.
+      if (!firstResult || (firstResult.type && firstResult.type !== "ok") || !Array.isArray(rows)) {
+        return null;
+      }
+
+      const row = rows[0];
       if (!row || !row[0]?.value) {
         this.setCache(key, null, now + this.ttlMs);
         return null;

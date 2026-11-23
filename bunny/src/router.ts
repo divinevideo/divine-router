@@ -593,6 +593,7 @@ export function webFingerNotFoundResponse(): Response {
     headers: {
       "content-type": "application/json",
       "access-control-allow-origin": "*",
+      "cache-control": "no-store",
     },
   });
 }
@@ -660,7 +661,10 @@ export function buildUsernameNotFoundResponse(username: string): Response {
 </html>`,
     {
       status: 404,
-      headers: { "content-type": "text/html; charset=utf-8" },
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      },
     },
   );
 }

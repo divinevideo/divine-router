@@ -178,10 +178,8 @@ def compare_to_baseline(
     margin_pct: float,
     floor_ms: float = DEFAULT_FLOOR_MS,
 ) -> Verdict:
-    if candidate.n == 0 or candidate.ttfb_p95_ms is None:
-        return Verdict(candidate.edge, candidate.region, "NO_DATA", None, "no successful samples")
-    if baseline.ttfb_p95_ms is None or baseline.ttfb_p95_ms <= 0:
-        return Verdict(candidate.edge, candidate.region, "NO_DATA", None, "baseline has no usable timings")
+    if candidate.n == 0:
+        return Verdict(candidate.edge, candidate.region, "NO_DATA", None, "no samples collected")
     if candidate.errors:
         return Verdict(
             candidate.edge,
@@ -190,6 +188,10 @@ def compare_to_baseline(
             None,
             f"{candidate.errors}/{candidate.n} requests failed",
         )
+    if candidate.ttfb_p95_ms is None:
+        return Verdict(candidate.edge, candidate.region, "NO_DATA", None, "no successful samples")
+    if baseline.ttfb_p95_ms is None or baseline.ttfb_p95_ms <= 0:
+        return Verdict(candidate.edge, candidate.region, "NO_DATA", None, "baseline has no usable timings")
 
     delta_ms = candidate.ttfb_p95_ms - baseline.ttfb_p95_ms
     delta = delta_ms / baseline.ttfb_p95_ms * 100.0
@@ -426,8 +428,12 @@ def run_contract_checks(
         },
     )
     report.auth_bypass_cache_status = auth_sample.cache_status
-    if auth_sample.status is not None:
-        report.auth_bypass_ok = not is_cache_hit(auth_sample.cache_status)
+    # Fail closed: require an HTTP response AND an explicit non-HIT cache-status header.
+    report.auth_bypass_ok = (
+        auth_sample.status is not None
+        and auth_sample.cache_status is not None
+        and not is_cache_hit(auth_sample.cache_status)
+    )
 
     # 3. Cold miss measurement with a unique query parameter
     sep = "&" if "?" in path else "?"
@@ -594,7 +600,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\nwrote {args.json}", file=sys.stderr)
 
     contracts_ok = all(
-        report.auth_bypass_ok is not False
+        report.auth_bypass_ok is True
         for name, report in contracts.items()
         if name != args.baseline
     )

@@ -193,6 +193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 errors[region] = err
 
+    any_probe_failed = False
     print("\n=== Multi-Region Router Benchmark Summary ===")
     print(f"{'Region':<12} {'Edge':<18} {'Conn':>6} {'p50':>7} {'p95':>7} {'ColdMiss':>9} {'Auth':>6} {'Err':>4}  Verdict")
     print("-" * 88)
@@ -212,6 +213,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             cold = f"{c['cold_miss_ttfb_ms']:.0f}ms" if c.get("cold_miss_ttfb_ms") is not None else "-"
             auth = "OK" if c.get("auth_bypass_ok") is True else ("FAIL" if c.get("auth_bypass_ok") is False else "-")
             verdict = "baseline" if edge_name == args.baseline else verdicts.get(edge_name, {}).get("verdict", "-")
+            if edge_name != args.baseline and (verdict != "PASS" or c.get("auth_bypass_ok") is not True):
+                any_probe_failed = True
             print(f"{region:<12} {edge_name:<18} {conn:>6} {p50:>7} {p95:>7} {cold:>9} {auth:>6} {s.get('errors', 0):>4}  {verdict}")
 
     if args.json:
@@ -219,7 +222,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump({"regions": results, "errors": errors}, fh, indent=2)
         print(f"\nWrote {args.json}", file=sys.stderr)
 
-    return 0 if not errors else 1
+    return 0 if (not errors and not any_probe_failed) else 1
 
 
 if __name__ == "__main__":

@@ -127,6 +127,17 @@ function buildUpstreamHeaders(
   return headers;
 }
 
+const CACHEABLE_FALLBACK_STATUSES = new Set([200, 203, 204, 206, 300, 301, 404, 410]);
+
+function replaceOrAppendStaleIfError(headerValue: string, seconds: number): string {
+  const cleaned = headerValue
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0 && !/^stale-if-error(?:\s*=|$)/i.test(part));
+  cleaned.push(`stale-if-error=${seconds}`);
+  return cleaned.join(", ");
+}
+
 /**
  * Applies divine-router's cache contract onto a proxied origin Response so a
  * fronting Bunny Pull Zone (or downstream cache) mirrors Fastly Compute's
@@ -140,14 +151,10 @@ export function applyResponseCachePolicy(
   const headers = new Headers(response.headers);
 
   if (cacheMode.kind === "Pass") {
-    // Unconditionally prevent fronting Bunny Pull Zones from caching pass routes,
-    // even if the origin emitted Cache-Control: public.
+    // Unconditionally prevent fronting Bunny Pull Zones and downstream caches
+    // from caching pass routes, even if the origin emitted Cache-Control: public.
     headers.set("cdn-cache-control", "no-store");
-    if (options.hasAuthorization) {
-      headers.set("cache-control", "private, no-store");
-    } else if (!headers.has("cache-control")) {
-      headers.set("cache-control", "no-store");
-    }
+    headers.set("cache-control", options.hasAuthorization ? "private, no-store" : "no-store");
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -159,8 +166,13 @@ export function applyResponseCachePolicy(
     parseEffectiveCacheTtlSecs(headers);
 
   if (isExplicitlyUncacheable) {
-    // Never upgrade an origin private/no-store/no-cache response to publicly cacheable.
+    // Never upgrade an origin private/no-store/no-cache response to publicly cacheable,
+    // and ensure Cache-Control itself is uncacheable even if only Surrogate-Control was.
     headers.set("cdn-cache-control", "no-store");
+    const existingCc = headers.get("cache-control") ?? "";
+    if (!/\b(?:private|no-store|no-cache)\b/i.test(existingCc)) {
+      headers.set("cache-control", "no-store");
+    }
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -188,7 +200,9 @@ export function applyResponseCachePolicy(
   if (!isServerError && surrogateControl) {
     if (!headers.has("cdn-cache-control")) {
       let mirrored = surrogateControl;
-      if (sieSecs !== null && !/stale-if-error/i.test(mirrored)) {
+      if (sieSecs === 0) {
+        mirrored = replaceOrAppendStaleIfError(mirrored, 0);
+      } else if (sieSecs !== null && !/stale-if-error/i.test(mirrored)) {
         mirrored = `${mirrored}, stale-if-error=${sieSecs}`;
       }
       headers.set("cdn-cache-control", mirrored);
@@ -204,7 +218,7 @@ export function applyResponseCachePolicy(
     }
   }
 
-  if (action.kind === "SetFallbackTtl") {
+  if (action.kind === "SetFallbackTtl" && CACHEABLE_FALLBACK_STATUSES.has(response.status)) {
     const directives = ["public", `max-age=${action.ttlSecs}`];
     if (sieSecs !== null) {
       directives.push(`stale-if-error=${sieSecs}`);
@@ -216,17 +230,22 @@ export function applyResponseCachePolicy(
     }
   } else if (!isServerError && sieSecs !== null) {
     const existingCc = headers.get("cache-control");
-    if (existingCc && !/stale-if-error/i.test(existingCc)) {
-      headers.set("cache-control", `${existingCc}, stale-if-error=${sieSecs}`);
-    }
     if (sieSecs === 0) {
-      // Explicitly opt non-API/non-RSS cacheable routes out of Pull Zone stale-if-error.
-      const existingCdnCc = headers.get("cdn-cache-control");
-      if (existingCdnCc && !/stale-if-error/i.test(existingCdnCc)) {
-        headers.set("cdn-cache-control", `${existingCdnCc}, stale-if-error=0`);
-      } else if (!existingCdnCc && existingCc) {
-        headers.set("cdn-cache-control", `${existingCc}, stale-if-error=0`);
+      // Explicitly opt non-API/non-RSS cacheable routes out of Pull Zone stale-if-error,
+      // overriding any origin-supplied stale-if-error directive.
+      if (existingCc) {
+        headers.set("cache-control", replaceOrAppendStaleIfError(existingCc, 0));
       }
+      const existingCdnCc = headers.get("cdn-cache-control");
+      if (existingCdnCc) {
+        headers.set("cdn-cache-control", replaceOrAppendStaleIfError(existingCdnCc, 0));
+      } else if (existingCc) {
+        headers.set("cdn-cache-control", replaceOrAppendStaleIfError(existingCc, 0));
+      } else {
+        headers.set("cdn-cache-control", "stale-if-error=0");
+      }
+    } else if (existingCc && !/stale-if-error/i.test(existingCc)) {
+      headers.set("cache-control", `${existingCc}, stale-if-error=${sieSecs}`);
     }
   }
 
@@ -243,7 +262,10 @@ async function handleWebFinger(url: URL, store: UsernameStore): Promise<Response
   if (parsed.kind === "BadRequest") {
     return new Response('{"error":"missing or malformed resource"}', {
       status: 400,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
     });
   }
   if (parsed.kind === "NotFound") {
@@ -298,6 +320,7 @@ async function handleUsernameRequest(
     for (const h of HOP_BY_HOP_HEADERS) {
       headers.delete(h);
     }
+    headers.delete("upgrade");
     headers.set("host", MAIN_BACKEND_HOST);
     headers.set("x-original-host", originalHost);
     const targetUrl = upstreamUrlFor(MAIN_BACKEND, url, config);
