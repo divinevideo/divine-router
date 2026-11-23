@@ -665,6 +665,28 @@ fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
     })
 }
 
+fn strict_tv_uses_caller_context(path: &str, url: &Url, has_pubkey: bool) -> bool {
+    if has_pubkey {
+        return true;
+    }
+
+    // Funnelcake does not share recommendations with request-specific ranking
+    // inputs. Pass these before lookup so private responses do not serialize
+    // waiters behind repeated uncacheable fills.
+    matches!(
+        path.trim_end_matches('/')
+            .split('/')
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["", "api", "users", _, "recommendations"]
+    ) && url.query_pairs().any(|(name, _)| {
+        matches!(
+            name.as_ref(),
+            "followed_hashtags" | "preferred_languages" | "seed"
+        )
+    })
+}
+
 fn strict_tv_cache_key(public_host: &str, url: &Url) -> [u8; 32] {
     let mut hash = Sha256::new();
     // Start a new cache namespace so requests cannot reuse entries filled
@@ -794,7 +816,13 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         original_host,
         req.get_method_str(),
         &path,
-        has_authorization || (strict_tv && req.contains_header("x-pubkey")),
+        has_authorization
+            || (strict_tv
+                && strict_tv_uses_caller_context(
+                    &path,
+                    req.get_url(),
+                    req.contains_header("x-pubkey"),
+                )),
         is_websocket_upgrade,
         backend,
     );
@@ -2466,6 +2494,36 @@ mod tests {
             strict_tv_cache_key("api.divine.video", &different_query)
         );
         assert_ne!(key, strict_tv_cache_key("api.dvines.org", &url));
+    }
+
+    #[test]
+    fn strict_tv_passes_recommendations_with_caller_context() {
+        for input in [
+            "followed_hashtags=dogs",
+            "preferred_languages=en",
+            "%73eed=1",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video/api/users/author/recommendations?view=tv&{input}"
+            ))
+            .unwrap();
+            assert!(
+                strict_tv_uses_caller_context(url.path(), &url, false),
+                "{input}"
+            );
+        }
+        for url in [
+            "https://api.divine.video/api/users/author/recommendations?view=tv&limit=20",
+            "https://api.divine.video/api/v2/videos?view=tv&seed=1",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert!(
+                !strict_tv_uses_caller_context(url.path(), &url, false),
+                "{url}"
+            );
+        }
+        let url = Url::parse("https://api.divine.video/api/v2/videos?view=tv").unwrap();
+        assert!(strict_tv_uses_caller_context(url.path(), &url, true));
     }
 
     #[test]
