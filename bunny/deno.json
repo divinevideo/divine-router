@@ -1,0 +1,18 @@
+{
+  "exports": "./src/router.ts",
+  "imports": {
+    "@bunny.net/edgescript-sdk": "npm:@bunny.net/edgescript-sdk@0.13.0",
+    "@std/assert": "jsr:@std/assert@1"
+  },
+  "tasks": {
+    "test": "deno test --allow-read src/router_test.ts",
+    "check": "deno check src/router.ts src/username_store.ts src/handler.ts src/main.ts src/middleware.ts src/dev_server.ts src/router_test.ts",
+    "dev": "deno run --allow-net --allow-read --allow-env src/dev_server.ts",
+    "bundle": "deno bundle --output dist/standalone.js src/main.ts",
+    "bundle:middleware": "deno bundle --output dist/middleware.js src/middleware.ts"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.window", "deno.unstable"]
+  }
+}
