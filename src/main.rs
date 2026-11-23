@@ -725,10 +725,14 @@ fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
         );
         candidate.set_stale_if_error(Duration::ZERO);
         candidate.set_stale_while_revalidate(Duration::ZERO);
-        if let Some(lease) = lease {
-            candidate.set_ttl(candidate.get_ttl().min(lease));
-        } else {
+        let remaining = lease
+            .unwrap_or_default()
+            .saturating_sub(candidate.get_age())
+            .min(candidate.get_ttl());
+        if remaining.is_zero() {
             candidate.set_uncacheable(false);
+        } else {
+            candidate.set_ttl(remaining);
         }
         Ok(())
     });
