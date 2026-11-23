@@ -224,17 +224,17 @@ export function applyResponseCachePolicy(
 
   const { hasSurrogateControl, ttlSecs, isExplicitlyUncacheable } =
     parseEffectiveCacheTtlSecs(headers);
+  const edgeControl = headers.get("cdn-cache-control");
 
   const setsCookie = headers.has("set-cookie");
   if (isExplicitlyUncacheable || setsCookie) {
     // Never upgrade an origin private/no-store/no-cache response to publicly cacheable,
     // and ensure Cache-Control itself is uncacheable even if only Surrogate-Control was.
-    // A response that sets a cookie is per-client, so it is never stored at the edge.
+    // Do not rely on a cache understanding CDN-Cache-Control to protect a cookie.
     headers.set("cdn-cache-control", "no-store");
     const existingCc = headers.get("cache-control") ?? "";
-    const needsClientNoStore = isExplicitlyUncacheable
-      ? !/\b(?:private|no-store|no-cache)\b/i.test(existingCc)
-      : existingCc === "";
+    const needsClientNoStore = setsCookie ||
+      !/\b(?:private|no-store|no-cache)\b/i.test(existingCc);
     if (needsClientNoStore) {
       headers.set("cache-control", "no-store");
     }
@@ -285,7 +285,12 @@ export function applyResponseCachePolicy(
     }
   }
 
-  if (action.kind === "SetFallbackTtl" && CACHEABLE_FALLBACK_STATUSES.has(response.status)) {
+  // An explicit CDN policy already governs the edge, even when the browser
+  // max-age is zero. Do not inject a fallback for other shared caches either.
+  if (
+    action.kind === "SetFallbackTtl" && edgeControl === null &&
+    CACHEABLE_FALLBACK_STATUSES.has(response.status)
+  ) {
     // Fastly's fallback (`candidate.set_ttl` in src/main.rs) only changes the edge
     // TTL; clients keep the origin's Cache-Control. Put the fallback in
     // CDN-Cache-Control and a shared-cache-only s-maxage, never in max-age.
@@ -293,9 +298,7 @@ export function applyResponseCachePolicy(
     if (sieSecs !== null) {
       directives.push(`stale-if-error=${sieSecs}`);
     }
-    if (!headers.has("cdn-cache-control")) {
-      headers.set("cdn-cache-control", directives.join(", "));
-    }
+    headers.set("cdn-cache-control", directives.join(", "));
     const existingCc = headers.get("cache-control");
     headers.set(
       "cache-control",

@@ -986,7 +986,7 @@ Deno.test("stale-if-error and Surrogate-Control stay at the edge; clients see or
   );
 });
 
-Deno.test("Set-Cookie responses are never stored at the edge", async () => {
+Deno.test("Set-Cookie responses get no-store for edge and downstream caches", async () => {
   for (const cc of [null, "public, max-age=60"]) {
     const headers: Record<string, string> = { "set-cookie": "sid=abc; Path=/" };
     if (cc) headers["cache-control"] = cc;
@@ -997,8 +997,24 @@ Deno.test("Set-Cookie responses are never stored at the edge", async () => {
       new Request("https://api.divine.video/api/videos", { headers: { host: "api.divine.video" } }),
     );
     assertEquals(resp.headers.get("cdn-cache-control"), "no-store");
-    assertEquals(resp.headers.get("cache-control"), cc ?? "no-store");
+    assertEquals(resp.headers.get("cache-control"), "no-store");
     assertEquals(resp.headers.get("set-cookie"), "sid=abc; Path=/");
+  }
+});
+
+Deno.test("An origin CDN policy suppresses the fallback and retains its edge TTL", async () => {
+  for (const edgeControl of ["no-store", "max-age=90, stale-if-error=5"]) {
+    const handler = createRouterHandler({
+      fetcher: () => Promise.resolve(new Response("{}", {
+        headers: { "cache-control": "max-age=0", "cdn-cache-control": edgeControl },
+      })),
+    });
+    const response = await handler(new Request("https://api.divine.video/api/videos"));
+    assertEquals(response.headers.get("cache-control"), "max-age=0");
+    assertEquals(
+      response.headers.get("cdn-cache-control"),
+      `${edgeControl.split(",")[0]}, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
+    );
   }
 });
 
