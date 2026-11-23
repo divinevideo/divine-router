@@ -30,7 +30,7 @@ const BLOCKED_SCRAPER_BODY: &str = "Forbidden\n";
 const BLOCKED_SCRAPER_CACHE_CONTROL: &str = "private, no-store";
 
 /// Known AI training and aggressive SEO scraper user-agent tokens blocked at
-/// the edge before reaching divine-web SSR or Funnelcake origin.
+/// this router before forwarding to a backend.
 ///
 /// Legitimate search engines (`Googlebot`, `Bingbot`, `DuckDuckBot`, `Applebot`
 /// without `-Extended`, `YandexBot`) and social link-preview crawlers
@@ -104,11 +104,14 @@ fn is_assistant_guide_only_user_agent(user_agent: &str) -> bool {
     user_agent_matches_any_token(user_agent, ASSISTANT_GUIDE_ONLY_USER_AGENTS)
 }
 
-fn is_scraper_exempt_path(path: &str) -> bool {
+fn is_scraper_exempt_path(host: &str, path: &str) -> bool {
     if path.split('/').any(|segment| segment == "..") {
         return false;
     }
-    path == "/robots.txt" || path.starts_with("/.well-known/") || is_activitypub_path(path)
+    let hostname = host.split(':').next().unwrap_or(host);
+    path.starts_with("/.well-known/")
+        || (path == "/robots.txt" && !matches!(classify_host(host), HostType::Username(_)))
+        || (is_owned_apex_domain(hostname) && is_activitypub_path(path))
 }
 
 fn is_assistant_guide_request(method: &str, path: &str) -> bool {
@@ -116,8 +119,13 @@ fn is_assistant_guide_request(method: &str, path: &str) -> bool {
         && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
 }
 
-fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> bool {
-    if method.eq_ignore_ascii_case("OPTIONS") || is_scraper_exempt_path(path) {
+fn should_block_scraper_for_host(
+    host: &str,
+    method: &str,
+    path: &str,
+    user_agent: Option<&str>,
+) -> bool {
+    if method.eq_ignore_ascii_case("OPTIONS") || is_scraper_exempt_path(host, path) {
         return false;
     }
     let Some(ua) = user_agent else {
@@ -127,7 +135,8 @@ fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> b
         return true;
     }
     if is_assistant_guide_only_user_agent(ua) {
-        return !is_assistant_guide_request(method, path);
+        return !is_assistant_guide_request(method, path)
+            || matches!(classify_host(host), HostType::Username(_));
     }
     false
 }
@@ -260,7 +269,8 @@ fn main(req: Request) -> Result<Response, Error> {
     let host = req.get_header_str("host").unwrap_or("").to_string();
     let path = req.get_path().to_string();
 
-    if should_block_scraper(
+    if should_block_scraper_for_host(
+        &host,
         req.get_method_str(),
         &path,
         req.get_header_str_lossy(header::USER_AGENT).as_deref(),
@@ -2598,6 +2608,45 @@ mod tests {
         assert!(is_public_divine_host("www.divine.video"));
         assert!(!is_public_divine_host("example.com"));
         assert!(!is_public_divine_host("foo.example.com"));
+    }
+
+    fn should_block_scraper(method: &str, path: &str, user_agent: Option<&str>) -> bool {
+        should_block_scraper_for_host("divine.video", method, path, user_agent)
+    }
+
+    #[test]
+    fn scraper_exemptions_do_not_send_profile_paths_to_username_routing() {
+        for (path, ua) in [
+            ("/robots.txt", "GPTBot/1.2"),
+            ("/ap/users/alice", "GPTBot/1.2"),
+            ("/nodeinfo/2.0", "GPTBot/1.2"),
+            ("/llms.txt", "ChatGPT-User/1.0"),
+        ] {
+            assert!(should_block_scraper_for_host(
+                "alice.divine.video",
+                "GET",
+                path,
+                Some(ua),
+            ));
+            assert!(!should_block_scraper("GET", path, Some(ua)));
+            assert!(!should_block_scraper_for_host(
+                "alice.divine.video",
+                "GET",
+                path,
+                Some("Googlebot/2.1"),
+            ));
+        }
+        assert!(!should_block_scraper_for_host(
+            "alice.divine.video",
+            "GET",
+            "/.well-known/nostr.json",
+            Some("GPTBot/1.2"),
+        ));
+        assert!(should_block_scraper(
+            "GET",
+            "/llms.txt",
+            Some("GPTBot/1.2 ChatGPT-User/1.0"),
+        ));
     }
 
     #[test]
