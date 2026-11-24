@@ -1626,4 +1626,76 @@ Deno.test("Bunny strict TV enforces policy and zero-Age on authenticated and cal
     });
     assertEquals(aged.status, 503);
   }
+
+  // Non-`/api/`-prefixed normalized paths (`//api/...`, `/%61pi/...`) must still
+  // force Pass mode (no CDN-Tag, private no-store, zero-Age enforcement) in both
+  // standalone and Pull Zone middleware handlers.
+  const nonCanonicalPrivateRequests = [
+    new Request("https://api.divine.video//api/v2/videos?view=tv", {
+      headers: { host: "api.divine.video", authorization: "Nostr abc" },
+    }),
+    new Request("https://api.divine.video/%61pi/v2/videos?view=tv", {
+      headers: { host: "api.divine.video", "x-pubkey": "a".repeat(64) },
+    }),
+    new Request("https://api.divine.video//api/users/author/recommendations?view=tv&seed=1", {
+      headers: { host: "api.divine.video" },
+    }),
+    new Request("https://api.divine.video/%61pi/users/author/recommendations?view=tv&seed=1", {
+      headers: { host: "api.divine.video" },
+    }),
+  ];
+
+  const standalone = createRouterHandler({
+    fetcher: () =>
+      Promise.resolve(
+        new Response('{"videos":[]}', {
+          status: 200,
+          headers: {
+            [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+            "surrogate-control": "max-age=30",
+            "surrogate-key": "videos strict-tv",
+          },
+        }),
+      ),
+  });
+
+  for (const req of nonCanonicalPrivateRequests) {
+    const standaloneResp = await standalone(req.clone());
+    assertEquals(standaloneResp.status, 200, req.url);
+    assertEquals(standaloneResp.headers.get("cdn-tag"), null, req.url);
+    assertEquals(standaloneResp.headers.get("cdn-cache-control"), "no-store", req.url);
+    assertEquals(standaloneResp.headers.get("cache-control"), "private, no-store", req.url);
+
+    const built = await middleware.onOriginRequest({ request: req }) as Request;
+    const mwResp = await middleware.onOriginResponse({
+      request: built,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: {
+          [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+          "surrogate-control": "max-age=30",
+          "surrogate-key": "videos strict-tv",
+        },
+      }),
+    });
+    assertEquals(mwResp.status, 200, req.url);
+    assertEquals(mwResp.headers.get("cdn-tag"), null, req.url);
+    assertEquals(mwResp.headers.get("cdn-cache-control"), "no-store", req.url);
+    assertEquals(mwResp.headers.get("cache-control"), "private, no-store", req.url);
+
+    // Nonzero Age on non-canonical private pass response must still fail closed with 503.
+    const aged = await middleware.onOriginResponse({
+      request: built,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: {
+          [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+          "surrogate-control": "max-age=30",
+          "surrogate-key": "videos strict-tv",
+          age: "1",
+        },
+      }),
+    });
+    assertEquals(aged.status, 503, req.url);
+  }
 });

@@ -455,7 +455,7 @@ export function applyStrictTvResponsePolicy(
   const status = response.status;
   if (!strictTvResponseAllowed(status, response.headers.get(STRICT_TV_POLICY_HEADER))) {
     console.error(`strict TV policy or status rejected: ${status}`);
-    void response.body?.cancel();
+    void response.body?.cancel().catch(() => {});
     return strictTvUnavailableResponse();
   }
 
@@ -463,7 +463,7 @@ export function applyStrictTvResponsePolicy(
   if (cacheMode.kind === "Pass") {
     if (isSuccess && !strictTvPassAgeAllowed(response.headers.get("age"))) {
       console.error("strict TV pass rejected a nonzero or invalid Age");
-      void response.body?.cancel();
+      void response.body?.cancel().catch(() => {});
       return strictTvUnavailableResponse();
     }
     const headers = new Headers(response.headers);
@@ -483,7 +483,7 @@ export function applyStrictTvResponsePolicy(
   const ageSecs = parseStrictTvAgeSecs(response.headers.get("age"));
   if (strictTvLeaseExpired(leaseSecs, ageSecs)) {
     console.error("strict TV lease expired");
-    void response.body?.cancel();
+    void response.body?.cancel().catch(() => {});
     return strictTvUnavailableResponse();
   }
 
@@ -567,15 +567,21 @@ export function createRouterHandler(
         const hasAuthorization = request.headers.has("authorization");
         const isWebsocketUpgrade =
           (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
-        const cacheMode = passthroughCacheMode(
-          originalHost,
-          method,
-          path,
-          hasAuthorization ||
-            (strictTv && strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey"))),
-          isWebsocketUpgrade,
-          decision.backend,
-        );
+        const strictTvPass =
+          strictTv &&
+          (hasAuthorization ||
+            isWebsocketUpgrade ||
+            strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey")));
+        const cacheMode: PassthroughCacheMode = strictTvPass
+          ? { kind: "Pass" }
+          : passthroughCacheMode(
+            originalHost,
+            method,
+            path,
+            hasAuthorization,
+            isWebsocketUpgrade,
+            decision.backend,
+          );
 
         const upstreamHeaders = buildUpstreamHeaders(
           request,
@@ -700,15 +706,21 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
     const hasAuthorization = request.headers.has("authorization");
     const isWebsocketUpgrade =
       (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
-    const cacheMode = passthroughCacheMode(
-      originalHost,
-      method,
-      path,
-      hasAuthorization ||
-        (strictTv && strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey"))),
-      isWebsocketUpgrade,
-      decision.backend,
-    );
+    const strictTvPass =
+      strictTv &&
+      (hasAuthorization ||
+        isWebsocketUpgrade ||
+        strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey")));
+    const cacheMode: PassthroughCacheMode = strictTvPass
+      ? { kind: "Pass" }
+      : passthroughCacheMode(
+        originalHost,
+        method,
+        path,
+        hasAuthorization,
+        isWebsocketUpgrade,
+        decision.backend,
+      );
     const upstreamHeaders = buildUpstreamHeaders(
       request,
       decision.backend,
@@ -754,25 +766,36 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       // ROUTER_HOP_TOKEN cannot trust the rewritten Host header; fail closed
       // so strict TV responses are never served unverified.
       console.error("strict TV response rejected: missing or mismatched router hop token");
-      void ctx.response.body?.cancel();
+      void ctx.response.body?.cancel().catch(() => {});
       return Promise.resolve(strictTvUnavailableResponse());
     }
 
     if (
       decision.kind === "Passthrough" &&
-      isStrictTvApiRequest(originalHost, method, decision.backend) &&
-      tvRequest(path, url) === "Strict"
+      isStrictTvApiRequest(originalHost, method, decision.backend)
     ) {
-      const cacheMode = passthroughCacheMode(
-        originalHost,
-        method,
-        path,
-        hasAuthorization ||
-          strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey")),
-        isWebsocketUpgrade,
-        decision.backend,
-      );
-      return Promise.resolve(applyStrictTvResponsePolicy(ctx.response, cacheMode));
+      const tvReq = tvRequest(path, url);
+      if (tvReq === "UnsupportedView") {
+        void ctx.response.body?.cancel().catch(() => {});
+        return Promise.resolve(strictTvBadRequestResponse());
+      }
+      if (tvReq === "Strict") {
+        const strictTvPass =
+          hasAuthorization ||
+          isWebsocketUpgrade ||
+          strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey"));
+        const cacheMode: PassthroughCacheMode = strictTvPass
+          ? { kind: "Pass" }
+          : passthroughCacheMode(
+            originalHost,
+            method,
+            path,
+            hasAuthorization,
+            isWebsocketUpgrade,
+            decision.backend,
+          );
+        return Promise.resolve(applyStrictTvResponsePolicy(ctx.response, cacheMode));
+      }
     }
 
     if (hasAuthorization) {

@@ -956,6 +956,37 @@ fn strict_tv_unavailable() -> Response {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn strict_tv_cache_mode(
+    original_host: &str,
+    method: &str,
+    path: &str,
+    url: &Url,
+    has_authorization: bool,
+    has_pubkey: bool,
+    is_websocket_upgrade: bool,
+    backend: &str,
+) -> PassthroughCacheMode {
+    // Force Pass directly for authenticated/caller-private strict TV reads so
+    // non-canonical prefixes like `//api/...` or `/%61pi/...` cannot bypass
+    // `passthrough_cache_mode`'s raw `/api/` prefix check and enter shared cache.
+    if has_authorization
+        || is_websocket_upgrade
+        || strict_tv_uses_caller_context(path, url, has_pubkey)
+    {
+        return PassthroughCacheMode::Pass;
+    }
+
+    passthrough_cache_mode(
+        original_host,
+        method,
+        path,
+        false,
+        is_websocket_upgrade,
+        backend,
+    )
+}
+
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
     let mut req = req;
     let path = req.get_path().to_string();
@@ -985,20 +1016,27 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
     }
     let strict_tv = tv_request == Some(TvRequest::Strict);
 
-    let cache_mode = passthrough_cache_mode(
-        original_host,
-        req.get_method_str(),
-        &path,
-        has_authorization
-            || (strict_tv
-                && strict_tv_uses_caller_context(
-                    &path,
-                    req.get_url(),
-                    req.contains_header("x-pubkey"),
-                )),
-        is_websocket_upgrade,
-        backend,
-    );
+    let cache_mode = if strict_tv {
+        strict_tv_cache_mode(
+            original_host,
+            req.get_method_str(),
+            &path,
+            req.get_url(),
+            has_authorization,
+            req.contains_header("x-pubkey"),
+            is_websocket_upgrade,
+            backend,
+        )
+    } else {
+        passthrough_cache_mode(
+            original_host,
+            req.get_method_str(),
+            &path,
+            has_authorization,
+            is_websocket_upgrade,
+            backend,
+        )
+    };
 
     if strict_tv {
         req.remove_header(STRICT_TV_POLICY_HEADER);
@@ -2770,6 +2808,8 @@ mod tests {
             "/api/users/author//recommendations",
             "/api/users/author/re%63ommendations",
             "/api/users/author/./recommendations/",
+            "//api/users/author/recommendations",
+            "/%61pi/users/author/recommendations",
         ] {
             let url = Url::parse(&format!(
                 "https://api.divine.video{raw_path}?view=tv&seed=1"
@@ -2778,6 +2818,53 @@ mod tests {
             assert!(
                 strict_tv_uses_caller_context(raw_path, &url, false),
                 "{raw_path}"
+            );
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    false,
+                    false,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "{raw_path}"
+            );
+        }
+
+        for raw_path in ["//api/v2/videos", "/%61pi/v2/videos"] {
+            let url = Url::parse(&format!("https://api.divine.video{raw_path}?view=tv")).unwrap();
+            assert_eq!(tv_request(raw_path, &url), Some(TvRequest::Strict));
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    true,
+                    false,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "auth {raw_path}"
+            );
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    false,
+                    true,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "pubkey {raw_path}"
             );
         }
     }
