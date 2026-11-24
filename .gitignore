@@ -31,3 +31,6 @@ Thumbs.db
 
 # Isolated development workspaces
 .worktrees/
+
+# Bunny Edge Script build output
+bunny/dist/

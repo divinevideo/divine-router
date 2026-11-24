@@ -1,0 +1,33 @@
+name: Bunny edge script
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bunny-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      - name: Typecheck Bunny router
+        working-directory: bunny
+        run: deno task check
+
+      - name: Test Bunny router parity
+        working-directory: bunny
+        run: deno task test
+
+      - name: Test edge probe and Bunny deploy script
+        run: python3 -m unittest tests.test_probe_router_edge tests.test_deploy_bunny
