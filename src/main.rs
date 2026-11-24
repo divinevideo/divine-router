@@ -767,17 +767,18 @@ enum TvRequest {
     UnsupportedView,
 }
 
-fn percent_decode_path(path: &str) -> Option<String> {
+fn percent_decode_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
-            }
-            let hi = (bytes[i + 1] as char).to_digit(16)?;
-            let lo = (bytes[i + 2] as char).to_digit(16)?;
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
             out.push(((hi << 4) | lo) as u8);
             i += 3;
         } else {
@@ -785,11 +786,12 @@ fn percent_decode_path(path: &str) -> Option<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).ok()
+    // Preserve route classification when an opaque segment is not valid UTF-8.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-fn normalized_api_path_segments(path: &str) -> Option<Vec<String>> {
-    let decoded = percent_decode_path(path)?;
+fn normalized_api_path_segments(path: &str) -> Vec<String> {
+    let decoded = percent_decode_path(path);
     let mut segments = Vec::new();
     for segment in decoded.split('/') {
         match segment {
@@ -800,13 +802,13 @@ fn normalized_api_path_segments(path: &str) -> Option<Vec<String>> {
             _ => segments.push(segment.to_string()),
         }
     }
-    Some(segments)
+    segments
 }
 
-fn raw_split_api_path_segments(path: &str) -> Option<Vec<String>> {
+fn raw_split_api_path_segments(path: &str) -> Vec<String> {
     let mut segments = Vec::new();
     for raw_segment in path.split('/') {
-        let segment = percent_decode_path(raw_segment)?;
+        let segment = percent_decode_path(raw_segment);
         match segment.as_str() {
             "" | "." => {}
             ".." => {
@@ -815,7 +817,7 @@ fn raw_split_api_path_segments(path: &str) -> Option<Vec<String>> {
             _ => segments.push(segment),
         }
     }
-    Some(segments)
+    segments
 }
 
 fn match_strict_tv_supports_view(segments: &[String]) -> Option<bool> {
@@ -837,10 +839,7 @@ fn match_strict_tv_supports_view(segments: &[String]) -> Option<bool> {
     }
 }
 
-fn is_user_recommendations_segments(segments: Option<&[String]>) -> bool {
-    let Some(segments) = segments else {
-        return false;
-    };
+fn is_user_recommendations_segments(segments: &[String]) -> bool {
     let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
     matches!(refs.as_slice(), ["api", "users", _, "recommendations"])
 }
@@ -851,10 +850,8 @@ fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
     // list d-tag such as `/api/v2/lists/<pubkey>/my%2Flist/items`).
     let full = normalized_api_path_segments(path);
     let raw = raw_split_api_path_segments(path);
-    let supports_tv_view = full
-        .as_deref()
-        .and_then(match_strict_tv_supports_view)
-        .or_else(|| raw.as_deref().and_then(match_strict_tv_supports_view))?;
+    let supports_tv_view =
+        match_strict_tv_supports_view(&full).or_else(|| match_strict_tv_supports_view(&raw))?;
     let mut view = false;
     for (key, value) in url.query_pairs() {
         match (key.as_ref(), value.as_ref()) {
@@ -880,8 +877,8 @@ fn strict_tv_uses_caller_context(path: &str, url: &Url, has_pubkey: bool) -> boo
     // waiters behind repeated uncacheable fills.
     let full = normalized_api_path_segments(path);
     let raw = raw_split_api_path_segments(path);
-    let is_recommendations = is_user_recommendations_segments(full.as_deref())
-        || is_user_recommendations_segments(raw.as_deref());
+    let is_recommendations =
+        is_user_recommendations_segments(&full) || is_user_recommendations_segments(&raw);
     is_recommendations
         && url.query_pairs().any(|(name, _)| {
             matches!(
@@ -2673,6 +2670,15 @@ mod tests {
                 host, "GET", path, false, false, policy,
             ));
         }
+    }
+
+    #[test]
+    fn api_path_decoder_preserves_opaque_segments() {
+        assert_eq!(
+            percent_decode_path("/labels/100%/caf%C3%A9"),
+            "/labels/100%/café"
+        );
+        assert_eq!(percent_decode_path("/labels/%FF"), "/labels/�");
     }
 
     #[test]

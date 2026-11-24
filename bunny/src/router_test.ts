@@ -35,6 +35,7 @@ import {
   MOBILE_API_BACKEND,
   MOBILE_API_BACKEND_HOST,
   normalizedAcceptEncoding,
+  normalizedApiPathSegments,
   parseStrictTvAgeSecs,
   parseWebFingerResource,
   passthroughCacheMode,
@@ -67,6 +68,11 @@ import {
   lookupUsernameWithFallback,
   MemoryUsernameStore,
 } from "./username_store.ts";
+
+Deno.test("API path decoding preserves opaque segments", () => {
+  assertEquals(normalizedApiPathSegments("/labels/100%/caf%C3%A9"), ["labels", "100%", "café"]);
+  assertEquals(normalizedApiPathSegments("/labels/%FF"), ["labels", "�"]);
+});
 
 function makeActiveUser(pubkey: string, relays: string[] = []): UsernameData {
   return { pubkey, relays, status: "active", atproto_did: null, atproto_state: null };

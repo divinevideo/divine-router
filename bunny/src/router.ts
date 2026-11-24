@@ -735,13 +735,8 @@ export type TvRequest = "Strict" | "UnsupportedView";
  * resolution) so raw-path tricks like `/api//v2/videos` or `/api/v2/%76ideos`
  * cannot bypass the strict TV gate or caller-context checks.
  */
-export function normalizedApiPathSegments(path: string): string[] | null {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(path);
-  } catch {
-    return null;
-  }
+export function normalizedApiPathSegments(path: string): string[] {
+  const decoded = decodeApiPath(path);
   const segments: string[] = [];
   for (const segment of decoded.split("/")) {
     if (segment === "" || segment === ".") {
@@ -756,15 +751,23 @@ export function normalizedApiPathSegments(path: string): string[] | null {
   return segments;
 }
 
-function rawSplitApiPathSegments(path: string): string[] | null {
+// Decode valid escape runs without discarding the surrounding route when an
+// opaque segment contains a literal percent or invalid UTF-8.
+function decodeApiPath(path: string): string {
+  const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+  return path.replace(/(?:%[0-9a-f]{2})+/gi, (run) => {
+    const bytes = new Uint8Array(run.length / 3);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Number.parseInt(run.slice(i * 3 + 1, i * 3 + 3), 16);
+    }
+    return decoder.decode(bytes);
+  });
+}
+
+function rawSplitApiPathSegments(path: string): string[] {
   const segments: string[] = [];
   for (const rawSegment of path.split("/")) {
-    let segment: string;
-    try {
-      segment = decodeURIComponent(rawSegment);
-    } catch {
-      return null;
-    }
+    const segment = decodeApiPath(rawSegment);
     if (segment === "" || segment === ".") {
       continue;
     }
@@ -823,8 +826,7 @@ export function tvRequest(path: string, url: URL): TvRequest | null {
   const fullSegments = normalizedApiPathSegments(path);
   const rawSegments = rawSplitApiPathSegments(path);
   const supportsTvView =
-    (fullSegments !== null ? matchStrictTvSupportsView(fullSegments) : null) ??
-    (rawSegments !== null ? matchStrictTvSupportsView(rawSegments) : null);
+    matchStrictTvSupportsView(fullSegments) ?? matchStrictTvSupportsView(rawSegments);
 
   if (supportsTvView === null) {
     return null;
@@ -860,9 +862,8 @@ export function isStrictTvApiRequest(
   );
 }
 
-function isUserRecommendationsSegments(segments: string[] | null): boolean {
+function isUserRecommendationsSegments(segments: string[]): boolean {
   return (
-    segments !== null &&
     segments.length === 4 &&
     segments[0] === "api" &&
     segments[1] === "users" &&
@@ -1004,8 +1005,8 @@ export function strictTvPassAgeAllowed(ageHeader: string | null): boolean {
  * Emitting only the 9-byte `strict-tv` tag avoids silent truncation while
  * keeping exact `{"CacheTag": "strict-tv"}` purges reliable regardless of page
  * size. Fails closed (returns `null`) if the origin header is absent, omits
- * `strict-tv`, or contains non-visible-ASCII bytes or commas (matching Fastly's
- * `HeaderValue::to_str()` rejection).
+ * `strict-tv`, or contains non-visible-ASCII bytes or commas. Fetch joins
+ * repeated header values with a comma, so the combined value is ambiguous.
  */
 export function strictTvCdnTag(surrogateKeyHeader: string | null): string | null {
   if (surrogateKeyHeader === null) {
