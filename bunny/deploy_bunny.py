@@ -189,6 +189,55 @@ def configure_api_pull_zone(
             ],
         },
         {
+            "Description": "divine-router: bypass cache when X-Pubkey header is present",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 1,  # RequestHeader
+                    "PatternMatchingType": 0,  # MatchAny
+                    "Parameter1": "X-Pubkey",
+                    "PatternMatches": ["*"],
+                }
+            ],
+        },
+        {
+            "Description": "divine-router: mark X-Pubkey responses private no-store",
+            "Enabled": True,
+            "ActionType": 5,  # SetResponseHeader
+            "ActionParameter1": "Cache-Control",
+            "ActionParameter2": "private, no-store",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 1,  # RequestHeader
+                    "PatternMatchingType": 0,  # MatchAny
+                    "Parameter1": "X-Pubkey",
+                    "PatternMatches": ["*"],
+                }
+            ],
+        },
+        {
+            "Description": "divine-router: bypass cache for caller-specific recommendations",
+            "Enabled": True,
+            "ActionType": 3,  # OverrideCacheTime
+            "ActionParameter1": "0",
+            "TriggerMatchingType": 0,  # MatchAny
+            "Triggers": [
+                {
+                    "Type": 0,  # Url
+                    "PatternMatchingType": 0,  # MatchAny
+                    "PatternMatches": [
+                        "*://*/api/users/*/recommendations?*followed_hashtags*",
+                        "*://*/api/users/*/recommendations?*preferred_languages*",
+                        "*://*/api/users/*/recommendations?*seed*",
+                    ],
+                }
+            ],
+        },
+        {
             "Description": "divine-router: bypass cache for candidate hosts",
             "Enabled": True,
             "ActionType": 3,  # OverrideCacheTime

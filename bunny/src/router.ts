@@ -34,6 +34,10 @@ export const SHORTENER_BACKEND_HOST = "vaguely-robust-ant.edgecompute.app";
 
 export const CANONICAL_API_HOST = "api.divine.video";
 export const CANONICAL_WEBFINGER_DOMAIN = "divine.video";
+export const STRICT_TV_POLICY_HEADER = "x-divine-tv-policy";
+export const STRICT_TV_POLICY = "strict-v1";
+export const STRICT_TV_SURROGATE_KEY = "strict-tv";
+export const STRICT_TV_MAX_AGE_SECS = 30;
 export const OWNED_APEX_DOMAINS: readonly string[] = ["divine.video", "dvines.org"];
 export const RETIRED_SYSTEM_CONTENT_TYPE = "text/plain; charset=utf-8";
 export const RETIRED_SYSTEM_BODY = "Gone\n";
@@ -721,4 +725,265 @@ export function parseEffectiveCacheTtlSecs(headers: Headers): {
   }
 
   return { hasSurrogateControl, ttlSecs: 0, isExplicitlyUncacheable: false };
+}
+
+export type TvRequest = "Strict" | "UnsupportedView";
+
+/**
+ * Classifies strict TV API requests identically to `tv_request` in `src/main.rs`.
+ * Search, comments, featured-tabs index, and public-list browse require
+ * `moderation_profile=strict`; feed and item routes also accept `view=tv`.
+ */
+export function tvRequest(path: string, url: URL): TvRequest | null {
+  const segments = path.replace(/\/+$/, "").split("/");
+  let supportsTvView: boolean | null = null;
+
+  if (
+    (segments.length === 3 && segments[0] === "" && segments[1] === "api" &&
+      (segments[2] === "search" || segments[2] === "featured-tabs")) ||
+    (segments.length === 4 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "v2" && (segments[3] === "search" || segments[3] === "lists")) ||
+    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "videos" && segments[4] === "comments") ||
+    (segments.length === 6 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "v2" && segments[3] === "videos" && segments[5] === "comments")
+  ) {
+    supportsTvView = false;
+  } else if (
+    (segments.length === 3 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "videos") ||
+    (segments.length === 4 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "v2" && segments[3] === "videos") ||
+    (segments.length === 6 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "lists" && segments[5] === "items") ||
+    (segments.length === 7 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "v2" && segments[3] === "lists" && segments[6] === "items") ||
+    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "users" &&
+      (segments[4] === "feed" || segments[4] === "recommendations")) ||
+    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
+      segments[2] === "featured-tabs" && segments[4] === "videos")
+  ) {
+    supportsTvView = true;
+  }
+
+  if (supportsTvView === null) {
+    return null;
+  }
+
+  let view = false;
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key === "moderation_profile" && value === "strict") {
+      return "Strict";
+    }
+    if (key === "view" && value === "tv") {
+      view = true;
+    }
+  }
+
+  if (!view) {
+    return null;
+  }
+  return supportsTvView ? "Strict" : "UnsupportedView";
+}
+
+export function isStrictTvApiRequest(
+  host: string,
+  method: string,
+  backend: BackendName | string,
+): boolean {
+  const classified = classifyHost(host);
+  return (
+    backend === FUNNELCAKE_API_BACKEND &&
+    classified.kind === "System" &&
+    classified.subdomain === "api" &&
+    method.toUpperCase() === "GET"
+  );
+}
+
+export function strictTvUsesCallerContext(
+  path: string,
+  url: URL,
+  hasPubkey: boolean,
+): boolean {
+  if (hasPubkey) {
+    return true;
+  }
+
+  const segments = path.replace(/\/+$/, "").split("/");
+  const isUserRecommendations =
+    segments.length === 5 &&
+    segments[0] === "" &&
+    segments[1] === "api" &&
+    segments[2] === "users" &&
+    segments[4] === "recommendations";
+  if (!isUserRecommendations) {
+    return false;
+  }
+
+  for (const name of url.searchParams.keys()) {
+    if (
+      name === "followed_hashtags" ||
+      name === "preferred_languages" ||
+      name === "seed"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function strictTvResponseAllowed(
+  status: number,
+  policy: string | null,
+): boolean {
+  const isClientError = status >= 400 && status <= 499;
+  const isServerError = status >= 500 && status <= 599;
+  const isSuccess = status >= 200 && status <= 299;
+  return isClientError || isServerError || (isSuccess && policy === STRICT_TV_POLICY);
+}
+
+export function strictTvCacheLeaseSecs(
+  status: number,
+  surrogateControl: string | null,
+): number | null {
+  if (status < 200 || status > 299 || surrogateControl === null) {
+    return null;
+  }
+
+  let minMaxAge: bigint | null = null;
+  for (const rawDirective of surrogateControl.split(",")) {
+    const directive = rawDirective.trim();
+    if (!directive) continue;
+    const eqIdx = directive.indexOf("=");
+    if (eqIdx === -1) {
+      const token = directive.toLowerCase();
+      if (token === "no-store" || token === "private" || token === "no-cache") {
+        return null;
+      }
+      continue;
+    }
+    const name = directive.slice(0, eqIdx).trim().toLowerCase();
+    if (name === "no-store" || name === "private" || name === "no-cache") {
+      return null;
+    }
+    if (name !== "max-age") {
+      continue;
+    }
+    const value = directive.slice(eqIdx + 1).trim();
+    if (!/^\d+$/.test(value)) {
+      continue;
+    }
+    const parsed = BigInt(value);
+    if (minMaxAge === null || parsed < minMaxAge) {
+      minMaxAge = parsed;
+    }
+  }
+
+  if (minMaxAge === null || minMaxAge === 0n) {
+    return null;
+  }
+  const cap = BigInt(STRICT_TV_MAX_AGE_SECS);
+  return Number(minMaxAge < cap ? minMaxAge : cap);
+}
+
+/**
+ * Parses an HTTP `Age` header for strict TV lease accounting.
+ * Returns `0` when absent, a non-negative integer capped at `Number.MAX_SAFE_INTEGER`
+ * when valid, or `null` when malformed (e.g. empty, list, or non-digit) so callers
+ * fail closed per RFC 9111 §1.2.2.
+ */
+export function parseStrictTvAgeSecs(ageHeader: string | null): number | null {
+  if (ageHeader === null) {
+    return 0;
+  }
+  const trimmed = ageHeader.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const parsed = BigInt(trimmed);
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  return Number(parsed > maxSafe ? maxSafe : parsed);
+}
+
+export function strictTvLeaseExpired(
+  leaseSecs: number | null,
+  ageSecs: number | null,
+): boolean {
+  if (leaseSecs === null) {
+    return false;
+  }
+  if (ageSecs === null) {
+    return true;
+  }
+  return ageSecs >= leaseSecs;
+}
+
+/**
+ * Mirrors `strict_tv_pass_age_allowed` in `src/main.rs`: caller-private strict
+ * reads only allow an absent or all-zero single delta-seconds `Age` value.
+ */
+export function strictTvPassAgeAllowed(ageHeader: string | null): boolean {
+  if (ageHeader === null) {
+    return true;
+  }
+  return /^0+$/.test(ageHeader);
+}
+
+/**
+ * Converts Funnelcake's space-delimited `Surrogate-Key` header into Bunny's
+ * `CDN-Tag` list. Fails closed (returns `null`) if the header contains any
+ * non-visible-ASCII character or comma (matching Fastly's `HeaderValue::to_str()`
+ * rejection) or omits the required `strict-tv` purge tag.
+ */
+export function parseStrictTvCdnTags(surrogateKeyHeader: string | null): string[] | null {
+  if (surrogateKeyHeader === null) {
+    return null;
+  }
+  for (let i = 0; i < surrogateKeyHeader.length; i++) {
+    const code = surrogateKeyHeader.charCodeAt(i);
+    // Allow ASCII space (0x20) and visible ASCII (0x21..=0x7E) except comma (0x2C),
+    // because Bunny's CDN-Tag header is comma-delimited.
+    if (code < 0x20 || code > 0x7e || code === 0x2c) {
+      return null;
+    }
+  }
+
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const token of surrogateKeyHeader.split(" ")) {
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    tags.push(token);
+  }
+  if (!seen.has(STRICT_TV_SURROGATE_KEY)) {
+    return null;
+  }
+  return tags;
+}
+
+export function strictTvErrorResponse(status: number, body: string): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "private, no-store",
+      "cdn-cache-control": "no-store",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
+export function strictTvBadRequestResponse(): Response {
+  return strictTvErrorResponse(
+    400,
+    '{"error":"Use moderation_profile=strict on this endpoint"}',
+  );
+}
+
+export function strictTvUnavailableResponse(): Response {
+  return strictTvErrorResponse(
+    503,
+    '{"error":"Strict content check unavailable"}',
+  );
 }

@@ -35,6 +35,8 @@ import {
   MOBILE_API_BACKEND,
   MOBILE_API_BACKEND_HOST,
   normalizedAcceptEncoding,
+  parseStrictTvAgeSecs,
+  parseStrictTvCdnTags,
   parseWebFingerResource,
   passthroughCacheMode,
   passthroughHeaders,
@@ -48,7 +50,15 @@ import {
   SOUND_PROXY_BACKEND,
   SOUND_PROXY_BACKEND_HOST,
   staleIfErrorOverrideSecs,
+  STRICT_TV_POLICY,
+  STRICT_TV_POLICY_HEADER,
+  strictTvCacheLeaseSecs,
+  strictTvLeaseExpired,
+  strictTvPassAgeAllowed,
+  strictTvResponseAllowed,
+  strictTvUsesCallerContext,
   SYSTEM_SUBDOMAINS,
+  tvRequest,
   type UsernameData,
 } from "./router.ts";
 import { createPullZoneMiddleware, createRouterHandler } from "./handler.ts";
@@ -1167,4 +1177,349 @@ Deno.test("a configured hop token is honored across middleware instances (separa
     resp.headers.get("cdn-cache-control"),
     `public, max-age=10, stale-if-error=${EDGE_STALE_IF_ERROR_SECS}`,
   );
+});
+
+Deno.test("strict TV query parsing and route matrix match src/main.rs", () => {
+  for (
+    const [query, expected] of [
+      ["", null],
+      ["moderation_profile=default", null],
+      ["moderation_profile=strict", "Strict"],
+      ["view=tv", "Strict"],
+      ["label=anything&%6doderation_profile=%73trict", "Strict"],
+      ["search=moderation_profile%3Dstrict", null],
+      ["view=tv+extra", null],
+    ] as const
+  ) {
+    const url = new URL(`https://api.divine.video/api/v2/videos?${query}`);
+    assertEquals(tvRequest(url.pathname, url), expected, query);
+  }
+
+  for (
+    const path of [
+      "/api/videos",
+      "/api/v2/videos",
+      "/api/search",
+      "/api/v2/search",
+      "/api/videos/event/comments",
+      "/api/v2/videos/event/comments",
+      "/api/users/author/feed",
+      "/api/users/author/recommendations",
+      "/api/v2/lists",
+      "/api/lists/author/tag/items",
+      "/api/v2/lists/author/tag/items",
+      "/api/featured-tabs",
+      "/api/featured-tabs/tab/videos",
+    ]
+  ) {
+    const url = new URL(`https://api.divine.video${path}?view=tv&moderation_profile=strict`);
+    assertEquals(tvRequest(path, url), "Strict", path);
+  }
+
+  for (
+    const path of [
+      "/api/categories",
+      "/api/hashtags",
+      "/api/users/author/events/3",
+      "/api/v2/search/lists",
+      "/api/v2/lists/discover",
+      "/api/videos/event",
+    ]
+  ) {
+    const url = new URL(`https://api.divine.video${path}?view=tv&moderation_profile=strict`);
+    assertEquals(tvRequest(path, url), null, path);
+  }
+
+  for (
+    const path of [
+      "/api/search",
+      "/api/v2/search",
+      "/api/featured-tabs",
+      "/api/v2/lists",
+      "/api/videos/event/comments",
+      "/api/v2/videos/event/comments",
+    ]
+  ) {
+    const url = new URL(`https://api.divine.video${path}?view=tv`);
+    assertEquals(tvRequest(path, url), "UnsupportedView", path);
+  }
+});
+
+Deno.test("strict TV caller context, lease, age, policy, and CDN-Tag helpers match Fastly", () => {
+  for (const input of ["followed_hashtags=dogs", "preferred_languages=en", "%73eed=1"]) {
+    const url = new URL(
+      `https://api.divine.video/api/users/author/recommendations?view=tv&${input}`,
+    );
+    assertEquals(strictTvUsesCallerContext(url.pathname, url, false), true, input);
+  }
+  for (
+    const raw of [
+      "https://api.divine.video/api/users/author/recommendations?view=tv&limit=20",
+      "https://api.divine.video/api/v2/videos?view=tv&seed=1",
+    ]
+  ) {
+    const url = new URL(raw);
+    assertEquals(strictTvUsesCallerContext(url.pathname, url, false), false, raw);
+  }
+  const videosUrl = new URL("https://api.divine.video/api/v2/videos?view=tv");
+  assertEquals(strictTvUsesCallerContext(videosUrl.pathname, videosUrl, true), true);
+
+  assertEquals(strictTvResponseAllowed(200, null), false);
+  assertEquals(strictTvResponseAllowed(200, "strict-v0"), false);
+  assertEquals(strictTvResponseAllowed(200, STRICT_TV_POLICY), true);
+  assertEquals(strictTvResponseAllowed(302, STRICT_TV_POLICY), false);
+  assertEquals(strictTvResponseAllowed(404, null), true);
+  assertEquals(strictTvResponseAllowed(503, null), true);
+
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=15"), 15);
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=120, stale-if-error=86400"), 30);
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=30, max-age=10"), 10);
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=99999999999999999999999"), 30);
+  assertEquals(strictTvCacheLeaseSecs(200, "no-store, max-age=30"), null);
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=30foo"), null);
+  assertEquals(strictTvCacheLeaseSecs(200, null), null);
+  assertEquals(strictTvCacheLeaseSecs(200, "max-age=0"), null);
+  assertEquals(strictTvCacheLeaseSecs(503, "max-age=30"), null);
+
+  assertEquals(parseStrictTvAgeSecs(null), 0);
+  assertEquals(parseStrictTvAgeSecs("0"), 0);
+  assertEquals(parseStrictTvAgeSecs("12"), 12);
+  assertEquals(parseStrictTvAgeSecs("99999999999999999999999"), Number.MAX_SAFE_INTEGER);
+  for (const invalid of ["", "5, 5", "invalid", "-1"]) {
+    assertEquals(parseStrictTvAgeSecs(invalid), null, invalid);
+  }
+
+  assertEquals(strictTvLeaseExpired(10, 9), false);
+  assertEquals(strictTvLeaseExpired(10, 10), true);
+  assertEquals(strictTvLeaseExpired(10, 15), true);
+  assertEquals(strictTvLeaseExpired(10, null), true);
+  assertEquals(strictTvLeaseExpired(null, 15), false);
+
+  for (const age of [null, "0", "00"]) {
+    assertEquals(strictTvPassAgeAllowed(age), true, String(age));
+  }
+  for (const age of ["", "1", "0, 0", "invalid", "99999999999999999999"]) {
+    assertEquals(strictTvPassAgeAllowed(age), false, age);
+  }
+
+  assertEquals(
+    parseStrictTvCdnTags("videos strict-tv author-abc strict-tv event-def"),
+    ["videos", "strict-tv", "author-abc", "event-def"],
+  );
+  assertEquals(parseStrictTvCdnTags(null), null);
+  assertEquals(parseStrictTvCdnTags("videos author-abc"), null);
+  // Fail closed on non-ASCII or comma tokens, matching Fastly's HeaderValue::to_str() check.
+  assertEquals(parseStrictTvCdnTags("videos strict-tv list-abc-música"), null);
+  assertEquals(parseStrictTvCdnTags("videos,strict-tv"), null);
+});
+
+Deno.test("Bunny strict TV caches attested 2xx up to 30s with CDN-Tag and zero stale", async () => {
+  let forwardedPolicyHeader: string | null = "untouched";
+  const handler = createRouterHandler({
+    fetcher: (_input, init) => {
+      forwardedPolicyHeader = new Headers(init?.headers).get(STRICT_TV_POLICY_HEADER);
+      return Promise.resolve(
+        new Response('{"videos":[]}', {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "public, max-age=0, must-revalidate",
+            "surrogate-control": "max-age=120, stale-if-error=86400",
+            "surrogate-key": "videos strict-tv author-abc event-def",
+            [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+            age: "10",
+          },
+        }),
+      );
+    },
+  });
+
+  const resp = await handler(
+    new Request("https://api.divine.video/api/v2/videos?view=tv&limit=10", {
+      headers: {
+        host: "api.divine.video",
+        [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+      },
+    }),
+  );
+
+  assertEquals(forwardedPolicyHeader, null, "spoofed request policy header must be stripped");
+  assertEquals(resp.status, 200);
+  assertEquals(resp.headers.get("surrogate-control"), null);
+  assertEquals(resp.headers.get("surrogate-key"), null);
+  assertEquals(resp.headers.get("cdn-tag"), "videos, strict-tv, author-abc, event-def");
+  assertEquals(
+    resp.headers.get("cdn-cache-control"),
+    "public, max-age=20, must-revalidate, stale-if-error=0, stale-while-revalidate=0",
+  );
+  assertEquals(
+    resp.headers.get("cache-control"),
+    "public, max-age=0, must-revalidate, proxy-revalidate, s-maxage=20, stale-if-error=0, stale-while-revalidate=0",
+  );
+});
+
+Deno.test("Bunny strict TV fails closed on unattested 200, 3xx, expired lease, upstream error, and bad view=tv", async () => {
+  const middleware = createPullZoneMiddleware({ hopToken: "tok" });
+
+  // Unsupported view=tv on strict-only route returns 400 without hitting origin.
+  const badView = await middleware.onOriginRequest({
+    request: new Request("https://api.divine.video/api/v2/lists?view=tv", {
+      headers: { host: "api.divine.video" },
+    }),
+  });
+  assertEquals(badView instanceof Response, true);
+  if (badView instanceof Response) {
+    assertEquals(badView.status, 400);
+    assertEquals(badView.headers.get("access-control-allow-origin"), "*");
+    assertEquals(badView.headers.get("cache-control"), "private, no-store");
+    assertEquals(badView.headers.get("cdn-cache-control"), "no-store");
+  }
+
+  const strictReq = await middleware.onOriginRequest({
+    request: new Request("https://api.divine.video/api/v2/videos?moderation_profile=strict", {
+      headers: { host: "api.divine.video", [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY },
+    }),
+  }) as Request;
+  assertEquals(strictReq.headers.get(STRICT_TV_POLICY_HEADER), null);
+
+  // Unattested 200 -> 503 with CORS and no-store.
+  const unattested = await middleware.onOriginResponse({
+    request: strictReq,
+    response: new Response('{"videos":[]}', {
+      status: 200,
+      headers: { "surrogate-control": "max-age=30", "surrogate-key": "videos strict-tv" },
+    }),
+  });
+  assertEquals(unattested.status, 503);
+  assertEquals(unattested.headers.get("access-control-allow-origin"), "*");
+  assertEquals(unattested.headers.get("cache-control"), "private, no-store");
+  assertEquals(unattested.headers.get("cdn-cache-control"), "no-store");
+
+  // 302 redirect -> 503.
+  const redirect = await middleware.onOriginResponse({
+    request: strictReq,
+    response: new Response(null, {
+      status: 302,
+      headers: { location: "https://example.com", [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY },
+    }),
+  });
+  assertEquals(redirect.status, 503);
+
+  // Exhausted lease (Age >= lease) -> 503.
+  const expired = await middleware.onOriginResponse({
+    request: strictReq,
+    response: new Response('{"videos":[]}', {
+      status: 200,
+      headers: {
+        [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+        "surrogate-control": "max-age=15",
+        "surrogate-key": "videos strict-tv",
+        age: "15",
+      },
+    }),
+  });
+  assertEquals(expired.status, 503);
+
+  // Malformed Age on leased response -> 503.
+  const badAge = await middleware.onOriginResponse({
+    request: strictReq,
+    response: new Response('{"videos":[]}', {
+      status: 200,
+      headers: {
+        [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+        "surrogate-control": "max-age=15",
+        "surrogate-key": "videos strict-tv",
+        age: "5, 5",
+      },
+    }),
+  });
+  assertEquals(badAge.status, 503);
+
+  // Non-ASCII Surrogate-Key fails closed to uncached 200 (never stored without purge tags).
+  const badKey = await middleware.onOriginResponse({
+    request: strictReq,
+    response: new Response('{"videos":[]}', {
+      status: 200,
+      headers: {
+        [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+        "surrogate-control": "max-age=30",
+        "surrogate-key": "videos strict-tv list-abc-música",
+      },
+    }),
+  });
+  assertEquals(badKey.status, 200);
+  assertEquals(badKey.headers.get("cdn-tag"), null);
+  assertEquals(badKey.headers.get("cdn-cache-control"), "no-store");
+  assertEquals(badKey.headers.get("cache-control"), "private, no-store");
+
+  // Upstream fetch failure in standalone mode returns CORS-readable 503.
+  const failingHandler = createRouterHandler({
+    fetcher: () => Promise.reject(new Error("origin down")),
+  });
+  const failed = await failingHandler(
+    new Request("https://api.divine.video/api/v2/videos?view=tv", {
+      headers: { host: "api.divine.video" },
+    }),
+  );
+  assertEquals(failed.status, 503);
+  assertEquals(failed.headers.get("access-control-allow-origin"), "*");
+  assertEquals(failed.headers.get("cache-control"), "private, no-store");
+});
+
+Deno.test("Bunny strict TV enforces policy and zero-Age on authenticated and caller-private pass reads", async () => {
+  const middleware = createPullZoneMiddleware({ hopToken: "tok" });
+
+  for (
+    const req of [
+      new Request("https://api.divine.video/api/v2/videos?moderation_profile=strict", {
+        headers: { host: "api.divine.video", authorization: "Nostr abc" },
+      }),
+      new Request("https://api.divine.video/api/v2/videos?moderation_profile=strict", {
+        headers: { host: "api.divine.video", "x-pubkey": "a".repeat(64) },
+      }),
+      new Request(
+        "https://api.divine.video/api/users/author/recommendations?view=tv&seed=42",
+        { headers: { host: "api.divine.video" } },
+      ),
+    ]
+  ) {
+    const built = await middleware.onOriginRequest({ request: req }) as Request;
+
+    // Attested pass response with Age: 0 is served uncached (no CDN-Tag).
+    const ok = await middleware.onOriginResponse({
+      request: built,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: {
+          [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+          "surrogate-control": "max-age=30",
+          "surrogate-key": "videos strict-tv",
+          age: "0",
+        },
+      }),
+    });
+    assertEquals(ok.status, 200);
+    assertEquals(ok.headers.get("cdn-tag"), null);
+    assertEquals(ok.headers.get("surrogate-control"), null);
+    assertEquals(ok.headers.get("surrogate-key"), null);
+    assertEquals(ok.headers.get("cdn-cache-control"), "no-store");
+    assertEquals(ok.headers.get("cache-control"), "private, no-store");
+
+    // Unattested pass response -> 503 even with Authorization header.
+    const unattested = await middleware.onOriginResponse({
+      request: built,
+      response: new Response('{"videos":[]}', { status: 200 }),
+    });
+    assertEquals(unattested.status, 503);
+
+    // Nonzero Age on pass response -> 503.
+    const aged = await middleware.onOriginResponse({
+      request: built,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: { [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY, age: "1" },
+      }),
+    });
+    assertEquals(aged.status, 503);
+  }
 });
