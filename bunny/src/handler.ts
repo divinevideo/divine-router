@@ -10,10 +10,12 @@ import {
   buildWebFingerJrd,
   candidateCacheAction,
   EDGE_STALE_IF_ERROR_SECS,
+  isStrictTvApiRequest,
   MAIN_BACKEND,
   MAIN_BACKEND_HOST,
   normalizedAcceptEncoding,
   parseEffectiveCacheTtlSecs,
+  parseStrictTvAgeSecs,
   parseWebFingerResource,
   passthroughCacheMode,
   passthroughHeaders,
@@ -21,6 +23,17 @@ import {
   routeDecisionFor,
   shouldNormalizeAcceptEncoding,
   staleIfErrorOverrideSecs,
+  STRICT_TV_MAX_AGE_SECS,
+  STRICT_TV_POLICY_HEADER,
+  strictTvBadRequestResponse,
+  strictTvCacheLeaseSecs,
+  strictTvCdnTag,
+  strictTvLeaseExpired,
+  strictTvPassAgeAllowed,
+  strictTvResponseAllowed,
+  strictTvUnavailableResponse,
+  strictTvUsesCallerContext,
+  tvRequest,
   webFingerNotFoundResponse,
   type BackendName,
   type PassthroughCacheMode,
@@ -115,6 +128,7 @@ function buildUpstreamHeaders(
   originalProto: string,
   cacheMode: PassthroughCacheMode,
   path: string,
+  strictTv = false,
 ): Headers {
   const headers = new Headers(incoming.headers);
   const isWebsocketUpgrade =
@@ -125,6 +139,10 @@ function buildUpstreamHeaders(
       headers.delete(h);
     }
     headers.delete("upgrade");
+  }
+
+  if (strictTv) {
+    headers.delete(STRICT_TV_POLICY_HEADER);
   }
 
   if (shouldNormalizeAcceptEncoding(cacheMode, backend, originalHost, path)) {
@@ -418,6 +436,98 @@ async function handleUsernameRequest(
 }
 
 /**
+ * Enforces the strict TV cache and attestation policy on a Bunny origin response.
+ *
+ * Mirrors `configure_strict_tv_cache` and post-send checks in `src/main.rs`:
+ * - Rejects unattested 2xx and all 3xx responses with a CORS-readable 503.
+ * - Rejects expired leases (or malformed Age headers on leased 2xx responses) with 503.
+ * - Rejects nonzero or invalid Age on caller-private (Pass) 2xx reads with 503.
+ * - Maps valid visible-ASCII `Surrogate-Key` tokens containing `strict-tv` into Bunny's
+ *   `CDN-Tag` header and caps shared caching to `min(lease - age, 30)` seconds with
+ *   `stale-if-error=0, stale-while-revalidate=0`.
+ * - Refuses to cache non-2xx, unleased, untagged, `Set-Cookie`, or `private`/`no-store`
+ *   responses (`CDN-Cache-Control: no-store`, `Cache-Control: private, no-store`).
+ */
+export function applyStrictTvResponsePolicy(
+  response: Response,
+  cacheMode: PassthroughCacheMode,
+): Response {
+  const status = response.status;
+  if (!strictTvResponseAllowed(status, response.headers.get(STRICT_TV_POLICY_HEADER))) {
+    console.error(`strict TV policy or status rejected: ${status}`);
+    void response.body?.cancel().catch(() => {});
+    return strictTvUnavailableResponse();
+  }
+
+  const isSuccess = status >= 200 && status <= 299;
+  if (cacheMode.kind === "Pass") {
+    if (isSuccess && !strictTvPassAgeAllowed(response.headers.get("age"))) {
+      console.error("strict TV pass rejected a nonzero or invalid Age");
+      void response.body?.cancel().catch(() => {});
+      return strictTvUnavailableResponse();
+    }
+    const headers = new Headers(response.headers);
+    headers.delete("surrogate-control");
+    headers.delete("surrogate-key");
+    headers.delete("cdn-tag");
+    headers.set("cdn-cache-control", "no-store");
+    headers.set("cache-control", "private, no-store");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  const leaseSecs = strictTvCacheLeaseSecs(status, response.headers.get("surrogate-control"));
+  const ageHeader = response.headers.get("age");
+  const ageSecs = parseStrictTvAgeSecs(ageHeader);
+  if (
+    strictTvLeaseExpired(leaseSecs, ageSecs) ||
+    (isSuccess && leaseSecs === null && !strictTvPassAgeAllowed(ageHeader))
+  ) {
+    console.error("strict TV lease expired");
+    void response.body?.cancel().catch(() => {});
+    return strictTvUnavailableResponse();
+  }
+
+  const headers = new Headers(response.headers);
+  const cdnTag = strictTvCdnTag(headers.get("surrogate-key"));
+  const setsCookie = headers.has("set-cookie");
+  const originCc = headers.get("cache-control") ?? "";
+  const originUncacheable = /(?:^|,|\s)(?:private|no-store|no-cache)(?:$|,|\s|=)/i.test(originCc);
+  const remaining =
+    leaseSecs !== null && ageSecs !== null
+      ? Math.min(Math.max(0, leaseSecs - ageSecs), STRICT_TV_MAX_AGE_SECS)
+      : 0;
+
+  headers.delete("surrogate-control");
+  headers.delete("surrogate-key");
+
+  if (remaining > 0 && cdnTag !== null && !setsCookie && !originUncacheable) {
+    headers.set("cdn-tag", cdnTag);
+    headers.set(
+      "cdn-cache-control",
+      `public, max-age=${remaining}, must-revalidate, stale-if-error=0, stale-while-revalidate=0`,
+    );
+    headers.set(
+      "cache-control",
+      `public, max-age=0, must-revalidate, proxy-revalidate, s-maxage=${remaining}, stale-if-error=0, stale-while-revalidate=0`,
+    );
+  } else {
+    headers.delete("cdn-tag");
+    headers.set("cdn-cache-control", "no-store");
+    headers.set("cache-control", "private, no-store");
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
  * Full standalone edge router handler matching src/main.rs.
  * Attach to `BunnySDK.net.http.serve(createRouterHandler(config))` or `Deno.serve(...)`.
  */
@@ -451,17 +561,31 @@ export function createRouterHandler(
           fetcher,
         );
       case "Passthrough": {
+        const tvReq = isStrictTvApiRequest(originalHost, method, decision.backend)
+          ? tvRequest(path, url)
+          : null;
+        if (tvReq === "UnsupportedView") {
+          return strictTvBadRequestResponse();
+        }
+        const strictTv = tvReq === "Strict";
         const hasAuthorization = request.headers.has("authorization");
         const isWebsocketUpgrade =
           (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
-        const cacheMode = passthroughCacheMode(
-          originalHost,
-          method,
-          path,
-          hasAuthorization,
-          isWebsocketUpgrade,
-          decision.backend,
-        );
+        const strictTvPass =
+          strictTv &&
+          (hasAuthorization ||
+            isWebsocketUpgrade ||
+            strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey")));
+        const cacheMode: PassthroughCacheMode = strictTvPass
+          ? { kind: "Pass" }
+          : passthroughCacheMode(
+            originalHost,
+            method,
+            path,
+            hasAuthorization,
+            isWebsocketUpgrade,
+            decision.backend,
+          );
 
         const upstreamHeaders = buildUpstreamHeaders(
           request,
@@ -470,21 +594,35 @@ export function createRouterHandler(
           originalProto,
           cacheMode,
           path,
+          strictTv,
         );
         const targetUrl = upstreamUrlFor(decision.backend, url, config);
 
-        const originResponse = await fetcher(targetUrl, {
-          method,
-          headers: upstreamHeaders,
-          body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
-          redirect: "manual",
-        });
+        let originResponse: Response;
+        try {
+          originResponse = await fetcher(targetUrl, {
+            method,
+            headers: upstreamHeaders,
+            body: method !== "GET" && method !== "HEAD" ? request.body : undefined,
+            redirect: "manual",
+          });
+        } catch (error) {
+          if (strictTv) {
+            console.error("strict TV upstream response unavailable:", error);
+            return strictTvUnavailableResponse();
+          }
+          throw error;
+        }
 
-        return applyResponseCachePolicy(
-          withDecodedBodyHeaders(originResponse, upstreamHeaders.get("accept-encoding"), config),
-          cacheMode,
-          { hasAuthorization },
+        const decoded = withDecodedBodyHeaders(
+          originResponse,
+          upstreamHeaders.get("accept-encoding"),
+          config,
         );
+        if (strictTv) {
+          return applyStrictTvResponsePolicy(decoded, cacheMode);
+        }
+        return applyResponseCachePolicy(decoded, cacheMode, { hasAuthorization });
       }
     }
   };
@@ -562,17 +700,31 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       });
     }
 
+    const tvReq = isStrictTvApiRequest(originalHost, method, decision.backend)
+      ? tvRequest(path, url)
+      : null;
+    if (tvReq === "UnsupportedView") {
+      return strictTvBadRequestResponse();
+    }
+    const strictTv = tvReq === "Strict";
     const hasAuthorization = request.headers.has("authorization");
     const isWebsocketUpgrade =
       (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
-    const cacheMode = passthroughCacheMode(
-      originalHost,
-      method,
-      path,
-      hasAuthorization,
-      isWebsocketUpgrade,
-      decision.backend,
-    );
+    const strictTvPass =
+      strictTv &&
+      (hasAuthorization ||
+        isWebsocketUpgrade ||
+        strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey")));
+    const cacheMode: PassthroughCacheMode = strictTvPass
+      ? { kind: "Pass" }
+      : passthroughCacheMode(
+        originalHost,
+        method,
+        path,
+        hasAuthorization,
+        isWebsocketUpgrade,
+        decision.backend,
+      );
     const upstreamHeaders = buildUpstreamHeaders(
       request,
       decision.backend,
@@ -580,6 +732,7 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
       originalProto,
       cacheMode,
       path,
+      strictTv,
     );
     upstreamHeaders.set(ROUTER_HOP_HEADER, hopToken);
     return new Request(upstreamUrlFor(decision.backend, url, config), {
@@ -603,6 +756,52 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
     const method = request.method.toUpperCase();
     const path = url.pathname;
     const hasAuthorization = request.headers.has("authorization");
+    const decision = routeDecisionFor(originalHost, method, path);
+    const isWebsocketUpgrade =
+      (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+
+    if (
+      !config.publicHostOverride &&
+      !builtByRouter &&
+      method === "GET" &&
+      tvRequest(path, url) !== null
+    ) {
+      // Cross-isolate execution without PUBLIC_HOST_OVERRIDE or a shared
+      // ROUTER_HOP_TOKEN cannot trust the rewritten Host header; fail closed
+      // so strict TV responses are never served unverified.
+      console.error("strict TV response rejected: missing or mismatched router hop token");
+      void ctx.response.body?.cancel().catch(() => {});
+      return Promise.resolve(strictTvUnavailableResponse());
+    }
+
+    if (
+      decision.kind === "Passthrough" &&
+      isStrictTvApiRequest(originalHost, method, decision.backend)
+    ) {
+      const tvReq = tvRequest(path, url);
+      if (tvReq === "UnsupportedView") {
+        void ctx.response.body?.cancel().catch(() => {});
+        return Promise.resolve(strictTvBadRequestResponse());
+      }
+      if (tvReq === "Strict") {
+        const strictTvPass =
+          hasAuthorization ||
+          isWebsocketUpgrade ||
+          strictTvUsesCallerContext(path, url, request.headers.has("x-pubkey"));
+        const cacheMode: PassthroughCacheMode = strictTvPass
+          ? { kind: "Pass" }
+          : passthroughCacheMode(
+            originalHost,
+            method,
+            path,
+            hasAuthorization,
+            isWebsocketUpgrade,
+            decision.backend,
+          );
+        return Promise.resolve(applyStrictTvResponsePolicy(ctx.response, cacheMode));
+      }
+    }
+
     if (hasAuthorization) {
       // The Pull Zone cache key ignores Authorization, so a response to an
       // authenticated request is never stored, whatever the route. This matches
@@ -611,13 +810,10 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
         applyResponseCachePolicy(ctx.response, { kind: "Pass" }, { hasAuthorization }),
       );
     }
-    const decision = routeDecisionFor(originalHost, method, path);
     if (decision.kind !== "Passthrough") {
       return Promise.resolve(ctx.response);
     }
 
-    const isWebsocketUpgrade =
-      (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
     const cacheMode = passthroughCacheMode(
       originalHost,
       method,

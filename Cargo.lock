@@ -87,6 +87,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "wasip2",
  "wit-bindgen 0.58.0",

@@ -77,8 +77,22 @@ class DeployBunnyTests(unittest.TestCase):
             "*://*/v1/account/moderation-status?*",
             "*://www.divine.video/api/links?*",
             "*://divine.video/l?*",
+            "*://*/api/users/*/recommendations?*followed_hashtags*",
+            "*://*/api/users/*/recommendations/?*followed_hashtags*",
+            "*://*/api/users/*/recommendations?*preferred_languages*",
+            "*://*/api/users/*/recommendations/?*preferred_languages*",
+            "*://*/api/users/*/recommendations?*seed*",
+            "*://*/api/users/*/recommendations/?*seed*",
         ):
             self.assertIn(route, patterns)
+        header_triggers = [
+            (r["ActionType"], r["ActionParameter1"], t.get("Parameter1"))
+            for r in rules
+            for t in r["Triggers"]
+            if t.get("Type") == 1
+        ]
+        self.assertIn((3, "0", "X-Pubkey"), header_triggers)
+        self.assertIn((5, "Cache-Control", "X-Pubkey"), header_triggers)
 
 
 if __name__ == "__main__":

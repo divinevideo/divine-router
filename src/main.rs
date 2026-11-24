@@ -2,10 +2,11 @@
 // ABOUTME: Routes username.divine.video to profiles, passes through system subdomains
 
 use fastly::http::request::SendErrorCause;
-use fastly::http::{StatusCode, header};
+use fastly::http::{StatusCode, Url, header};
 use fastly::kv_store::KVStore;
 use fastly::{Error, Request, Response};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -22,6 +23,10 @@ const SHORTENER_BACKEND_HOST: &str = "vaguely-robust-ant.edgecompute.app";
 const KV_STORE_NAME: &str = "divine-names";
 const CANONICAL_API_HOST: &str = "api.divine.video";
 const CANONICAL_WEBFINGER_DOMAIN: &str = "divine.video";
+const STRICT_TV_POLICY_HEADER: &str = "x-divine-tv-policy";
+const STRICT_TV_POLICY: &str = "strict-v1";
+const STRICT_TV_SURROGATE_KEY: &str = "strict-tv";
+const STRICT_TV_MAX_AGE: Duration = Duration::from_secs(30);
 const OWNED_APEX_DOMAINS: &[&str] = &["divine.video", "dvines.org"];
 const RETIRED_SYSTEM_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const RETIRED_SYSTEM_BODY: &str = "Gone\n";
@@ -756,6 +761,291 @@ fn normalized_accept_encoding(header: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TvRequest {
+    Strict,
+    UnsupportedView,
+}
+
+fn percent_decode_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // Preserve route classification when an opaque segment is not valid UTF-8.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn normalized_api_path_segments(path: &str) -> Vec<String> {
+    let decoded = percent_decode_path(path);
+    let mut segments = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment.to_string()),
+        }
+    }
+    segments
+}
+
+fn raw_split_api_path_segments(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    for raw_segment in path.split('/') {
+        let segment = percent_decode_path(raw_segment);
+        match segment.as_str() {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    segments
+}
+
+fn match_strict_tv_supports_view(segments: &[String]) -> Option<bool> {
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match refs.as_slice() {
+        ["api", "search"]
+        | ["api", "v2", "search"]
+        | ["api", "featured-tabs"]
+        | ["api", "v2", "lists"]
+        | ["api", "videos", _, "comments"]
+        | ["api", "v2", "videos", _, "comments"] => Some(false),
+        ["api", "videos"]
+        | ["api", "v2", "videos"]
+        | ["api", "lists", _, _, "items"]
+        | ["api", "v2", "lists", _, _, "items"]
+        | ["api", "users", _, "feed" | "recommendations"]
+        | ["api", "featured-tabs", _, "videos"] => Some(true),
+        _ => None,
+    }
+}
+
+fn is_user_recommendations_segments(segments: &[String]) -> bool {
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(refs.as_slice(), ["api", "users", _, "recommendations"])
+}
+
+fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
+    // Check both full-decoded segments (catches `/api/v2%2Fvideos`) and
+    // raw-slash-split per-segment-decoded segments (catches `%2F` inside a
+    // list d-tag such as `/api/v2/lists/<pubkey>/my%2Flist/items`).
+    let full = normalized_api_path_segments(path);
+    let raw = raw_split_api_path_segments(path);
+    let supports_tv_view =
+        match_strict_tv_supports_view(&full).or_else(|| match_strict_tv_supports_view(&raw))?;
+    let mut view = false;
+    for (key, value) in url.query_pairs() {
+        match (key.as_ref(), value.as_ref()) {
+            ("moderation_profile", "strict") => return Some(TvRequest::Strict),
+            ("view", "tv") => view = true,
+            _ => {}
+        }
+    }
+    view.then_some(if supports_tv_view {
+        TvRequest::Strict
+    } else {
+        TvRequest::UnsupportedView
+    })
+}
+
+fn strict_tv_uses_caller_context(path: &str, url: &Url, has_pubkey: bool) -> bool {
+    if has_pubkey {
+        return true;
+    }
+
+    // Funnelcake does not share recommendations with request-specific ranking
+    // inputs. Pass these before lookup so private responses do not serialize
+    // waiters behind repeated uncacheable fills.
+    let full = normalized_api_path_segments(path);
+    let raw = raw_split_api_path_segments(path);
+    let is_recommendations =
+        is_user_recommendations_segments(&full) || is_user_recommendations_segments(&raw);
+    is_recommendations
+        && url.query_pairs().any(|(name, _)| {
+            matches!(
+                name.as_ref(),
+                "followed_hashtags" | "preferred_languages" | "seed"
+            )
+        })
+}
+
+fn strict_tv_cache_key(public_host: &str, url: &Url) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    // Start a new cache namespace so requests cannot reuse entries filled
+    // before the origin attestation and stale controls were introduced.
+    hash.update(b"divine-router:strict-tv:v1\0");
+    hash.update(public_host.to_ascii_lowercase().as_bytes());
+    hash.update(b"\0");
+    hash.update(url.as_str().as_bytes());
+    hash.finalize().into()
+}
+
+fn strict_tv_response_allowed(status: StatusCode, policy: Option<&str>) -> bool {
+    status.is_client_error()
+        || status.is_server_error()
+        || (status.is_success() && policy == Some(STRICT_TV_POLICY))
+}
+
+fn strict_tv_cache_lease(status: StatusCode, surrogate_control: Option<&str>) -> Option<Duration> {
+    if !status.is_success() {
+        return None;
+    }
+
+    let mut min_max_age: Option<u64> = None;
+    for raw_directive in surrogate_control?.split(',') {
+        let directive = raw_directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let (name, value) = match directive.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (directive, None),
+        };
+        if name.eq_ignore_ascii_case("no-store")
+            || name.eq_ignore_ascii_case("private")
+            || name.eq_ignore_ascii_case("no-cache")
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("max-age") {
+            if let Some(secs) = value.and_then(|v| v.parse::<u64>().ok()) {
+                min_max_age = Some(min_max_age.map_or(secs, |cur| cur.min(secs)));
+            }
+        }
+    }
+    let max_age = min_max_age?;
+    (max_age > 0).then(|| Duration::from_secs(max_age).min(STRICT_TV_MAX_AGE))
+}
+
+fn strict_tv_lease_expired(lease: Option<Duration>, age: Duration) -> bool {
+    lease.is_some_and(|lease| age >= lease)
+}
+
+fn strict_tv_unleased_success_age_rejected(
+    status: StatusCode,
+    lease: Option<Duration>,
+    age: Duration,
+    all_ages_zero_or_absent: bool,
+) -> bool {
+    status.is_success() && lease.is_none() && (age > Duration::ZERO || !all_ages_zero_or_absent)
+}
+
+fn strict_tv_pass_age_allowed(age: &fastly::http::HeaderValue) -> bool {
+    // Age is a single delta-seconds value. Absent or zero is the only age
+    // allowed on caller-private reads; surrogate headers may be stripped.
+    let digits = age.as_bytes();
+    !digits.is_empty() && digits.iter().all(|&byte| byte == b'0')
+}
+
+fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
+    let key = strict_tv_cache_key(public_host, req.get_url());
+    req.set_cache_key(key);
+    req.set_stale_if_error(0);
+    req.set_stale_while_revalidate(0);
+    req.set_after_send(|candidate| {
+        let status = candidate.get_status();
+        if !strict_tv_response_allowed(status, candidate.get_header_str(STRICT_TV_POLICY_HEADER)) {
+            return Err(SendErrorCause::Custom(Error::msg(
+                "strict TV origin policy or status rejected",
+            )));
+        }
+
+        let lease = strict_tv_cache_lease(status, candidate.get_header_str("surrogate-control"));
+        let age = candidate.get_age();
+        let all_ages_zero_or_absent = candidate
+            .get_header_all(header::AGE)
+            .all(strict_tv_pass_age_allowed);
+        if strict_tv_lease_expired(lease, age)
+            || strict_tv_unleased_success_age_rejected(status, lease, age, all_ages_zero_or_absent)
+        {
+            return Err(SendErrorCause::Custom(Error::msg(
+                "strict TV lease expired",
+            )));
+        }
+        candidate.set_stale_if_error(Duration::ZERO);
+        candidate.set_stale_while_revalidate(Duration::ZERO);
+        let remaining = lease
+            .unwrap_or_default()
+            .saturating_sub(age)
+            .min(candidate.get_ttl());
+        // Check the SDK's effective storage keys, not the raw response header.
+        let has_purge_key = candidate
+            .get_surrogate_keys()
+            .any(|key| key == STRICT_TV_SURROGATE_KEY);
+        if remaining.is_zero() || !has_purge_key {
+            candidate.set_uncacheable(false);
+        } else {
+            candidate.set_ttl(remaining);
+        }
+        Ok(())
+    });
+}
+
+fn strict_tv_error(status: StatusCode, body: &'static str) -> Response {
+    Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_header(header::CACHE_CONTROL, "private, no-store")
+        .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .with_body(body)
+}
+
+fn strict_tv_unavailable() -> Response {
+    strict_tv_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":"Strict content check unavailable"}"#,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strict_tv_cache_mode(
+    original_host: &str,
+    method: &str,
+    path: &str,
+    url: &Url,
+    has_authorization: bool,
+    has_pubkey: bool,
+    is_websocket_upgrade: bool,
+    backend: &str,
+) -> PassthroughCacheMode {
+    // Force Pass directly for authenticated/caller-private strict TV reads so
+    // non-canonical prefixes like `//api/...` or `/%61pi/...` cannot bypass
+    // `passthrough_cache_mode`'s raw `/api/` prefix check and enter shared cache.
+    if has_authorization
+        || is_websocket_upgrade
+        || strict_tv_uses_caller_context(path, url, has_pubkey)
+    {
+        return PassthroughCacheMode::Pass;
+    }
+
+    passthrough_cache_mode(
+        original_host,
+        method,
+        path,
+        false,
+        is_websocket_upgrade,
+        backend,
+    )
+}
+
 fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Response, Error> {
     let mut req = req;
     let path = req.get_path().to_string();
@@ -769,48 +1059,86 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         .get_header_str(header::UPGRADE)
         .map(|value| value.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false);
-    let cache_mode = passthrough_cache_mode(
-        original_host,
-        req.get_method_str(),
-        &path,
-        has_authorization,
-        is_websocket_upgrade,
-        backend,
-    );
-
-    // Pin eligible API/RSS stale reuse at the edge. Ordinary cacheable routes retain the
-    // zero-second opt-out, while pass routes receive no override that could reverse pass mode.
-    if let Some(stale_if_error_secs) = stale_if_error_override_secs(cache_mode) {
-        req.set_stale_if_error(stale_if_error_secs);
+    let tv_request = if backend == FUNNELCAKE_API_BACKEND
+        && matches!(classify_host(original_host), HostType::System(ref subdomain) if subdomain == "api")
+        && req.get_method_str().eq_ignore_ascii_case("GET")
+    {
+        tv_request(&path, req.get_url())
+    } else {
+        None
+    };
+    if tv_request == Some(TvRequest::UnsupportedView) {
+        return Ok(strict_tv_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"Use moderation_profile=strict on this endpoint"}"#,
+        ));
     }
+    let strict_tv = tv_request == Some(TvRequest::Strict);
 
-    match cache_mode {
-        PassthroughCacheMode::Pass => req.set_pass(true),
-        PassthroughCacheMode::Cacheable {
-            fallback_ttl_secs,
-            honors_origin_stale_if_error,
-        } => {
-            if should_register_cache_hook(fallback_ttl_secs, honors_origin_stale_if_error) {
-                req.set_after_send(move |candidate| {
-                    match candidate_cache_action(
-                        honors_origin_stale_if_error,
-                        candidate.get_status().is_server_error(),
-                        candidate.stale_if_error_available(),
-                        candidate.contains_header("surrogate-control"),
-                        candidate.get_ttl(),
-                        fallback_ttl_secs,
-                    ) {
-                        CandidateCacheAction::ServeStale => {
-                            // An after-send error discards the 5xx candidate and serves available stale.
-                            Err(SendErrorCause::DestinationUnavailable)
+    let cache_mode = if strict_tv {
+        strict_tv_cache_mode(
+            original_host,
+            req.get_method_str(),
+            &path,
+            req.get_url(),
+            has_authorization,
+            req.contains_header("x-pubkey"),
+            is_websocket_upgrade,
+            backend,
+        )
+    } else {
+        passthrough_cache_mode(
+            original_host,
+            req.get_method_str(),
+            &path,
+            has_authorization,
+            is_websocket_upgrade,
+            backend,
+        )
+    };
+
+    if strict_tv {
+        req.remove_header(STRICT_TV_POLICY_HEADER);
+        if cache_mode == PassthroughCacheMode::Pass {
+            req.set_pass(true);
+        } else {
+            configure_strict_tv_cache(&mut req, original_host);
+        }
+    } else {
+        // Pin eligible API/RSS stale reuse at the edge. Ordinary cacheable routes retain the
+        // zero-second opt-out, while pass routes receive no override that could reverse pass mode.
+        if let Some(stale_if_error_secs) = stale_if_error_override_secs(cache_mode) {
+            req.set_stale_if_error(stale_if_error_secs);
+        }
+
+        match cache_mode {
+            PassthroughCacheMode::Pass => req.set_pass(true),
+            PassthroughCacheMode::Cacheable {
+                fallback_ttl_secs,
+                honors_origin_stale_if_error,
+            } => {
+                if should_register_cache_hook(fallback_ttl_secs, honors_origin_stale_if_error) {
+                    req.set_after_send(move |candidate| {
+                        match candidate_cache_action(
+                            honors_origin_stale_if_error,
+                            candidate.get_status().is_server_error(),
+                            candidate.stale_if_error_available(),
+                            candidate.contains_header("surrogate-control"),
+                            candidate.get_ttl(),
+                            fallback_ttl_secs,
+                        ) {
+                            CandidateCacheAction::ServeStale => {
+                                // An after-send error discards the 5xx candidate and serves available stale.
+                                Err(SendErrorCause::DestinationUnavailable)
+                            }
+                            CandidateCacheAction::SetFallbackTtl(ttl) => {
+                                candidate.set_ttl(ttl);
+                                Ok(())
+                            }
+                            CandidateCacheAction::PreserveOrigin => Ok(()),
                         }
-                        CandidateCacheAction::SetFallbackTtl(ttl) => {
-                            candidate.set_ttl(ttl);
-                            Ok(())
-                        }
-                        CandidateCacheAction::PreserveOrigin => Ok(()),
-                    }
-                });
+                    });
+                }
             }
         }
     }
@@ -828,7 +1156,45 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
     }
 
     apply_passthrough_headers(&mut req, headers);
-    Ok(req.send(backend)?)
+    let mut response = match req.send(backend) {
+        Ok(response) => response,
+        Err(error) if strict_tv => {
+            eprintln!(
+                "strict TV upstream response unavailable: {}",
+                error.root_cause()
+            );
+            return Ok(strict_tv_unavailable());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if strict_tv {
+        // A backend pass skips cache hooks, and a hit skips the origin entirely.
+        if !strict_tv_response_allowed(
+            response.get_status(),
+            response.get_header_str(STRICT_TV_POLICY_HEADER),
+        ) {
+            eprintln!(
+                "strict TV policy or status rejected: {}",
+                response.get_status()
+            );
+            return Ok(strict_tv_unavailable());
+        }
+        if cache_mode == PassthroughCacheMode::Pass
+            && response.get_status().is_success()
+            && !response
+                .get_header_all(header::AGE)
+                .all(strict_tv_pass_age_allowed)
+        {
+            eprintln!("strict TV pass rejected a nonzero or invalid Age");
+            return Ok(strict_tv_unavailable());
+        }
+        // This runs after the readthrough cache decision. TV clients should
+        // always return to the edge so moderation purges reach each new read.
+        response.remove_header("surrogate-control");
+        response.remove_header("surrogate-key");
+        response.set_header(header::CACHE_CONTROL, "private, no-store");
+    }
+    Ok(response)
 }
 
 fn handle_username_request(username: &str, path: &str, req: Request) -> Result<Response, Error> {
@@ -2303,6 +2669,317 @@ mod tests {
             assert!(!honors_origin_stale_if_error(
                 host, "GET", path, false, false, policy,
             ));
+        }
+    }
+
+    #[test]
+    fn api_path_decoder_preserves_opaque_segments() {
+        assert_eq!(
+            percent_decode_path("/labels/100%/caf%C3%A9"),
+            "/labels/100%/café"
+        );
+        assert_eq!(percent_decode_path("/labels/%FF"), "/labels/�");
+    }
+
+    #[test]
+    fn strict_view_decodes_the_same_query_values_as_the_origin() {
+        for (query, strict) in [
+            ("", false),
+            ("moderation_profile=default", false),
+            ("moderation_profile=strict", true),
+            ("view=tv", true),
+            ("label=anything&%6doderation_profile=%73trict", true),
+            ("search=moderation_profile%3Dstrict", false),
+            ("view=tv+extra", false),
+        ] {
+            let url =
+                Url::parse(&format!("https://api.divine.video/api/v2/videos?{query}")).unwrap();
+            assert_eq!(
+                tv_request(url.path(), &url),
+                strict.then_some(TvRequest::Strict),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_tv_gate_applies_to_supported_content_paths() {
+        for path in [
+            "/api/videos",
+            "/api/v2/videos",
+            "/api/search",
+            "/api/v2/search",
+            "/api/videos/event/comments",
+            "/api/v2/videos/event/comments",
+            "/api/users/author/feed",
+            "/api/users/author/recommendations",
+            "/api/v2/lists",
+            "/api/lists/author/tag/items",
+            "/api/v2/lists/author/tag/items",
+            "/api/featured-tabs",
+            "/api/featured-tabs/tab/videos",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video{path}?view=tv&moderation_profile=strict"
+            ))
+            .unwrap();
+            assert_eq!(tv_request(path, &url), Some(TvRequest::Strict), "{path}");
+        }
+        for path in [
+            "/api/categories",
+            "/api/hashtags",
+            "/api/users/author/events/3",
+            "/api/v2/search/lists",
+            "/api/v2/lists/discover",
+            "/api/videos/event",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video{path}?view=tv&moderation_profile=strict"
+            ))
+            .unwrap();
+            assert_eq!(tv_request(path, &url), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn strict_only_routes_reject_tv_view() {
+        for path in [
+            "/api/search",
+            "/api/v2/search",
+            "/api/featured-tabs",
+            "/api/v2/lists",
+            "/api/videos/event/comments",
+            "/api/v2/videos/event/comments",
+        ] {
+            let url = Url::parse(&format!("https://api.divine.video{path}?view=tv")).unwrap();
+            assert_eq!(
+                tv_request(path, &url),
+                Some(TvRequest::UnsupportedView),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_cache_key_preserves_the_full_url_and_authority() {
+        let url = Url::parse("https://api.divine.video/api/v2/videos?view=tv&limit=12").unwrap();
+        let different_query =
+            Url::parse("https://api.divine.video/api/v2/videos?view=tv&limit=13").unwrap();
+        let key = strict_tv_cache_key("api.divine.video", &url);
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, strict_tv_cache_key("API.DIVINE.VIDEO", &url));
+        assert_ne!(
+            key,
+            strict_tv_cache_key("api.divine.video", &different_query)
+        );
+        assert_ne!(key, strict_tv_cache_key("api.dvines.org", &url));
+    }
+
+    #[test]
+    fn strict_tv_passes_recommendations_with_caller_context() {
+        for input in [
+            "followed_hashtags=dogs",
+            "preferred_languages=en",
+            "%73eed=1",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video/api/users/author/recommendations?view=tv&{input}"
+            ))
+            .unwrap();
+            assert!(
+                strict_tv_uses_caller_context(url.path(), &url, false),
+                "{input}"
+            );
+        }
+        for url in [
+            "https://api.divine.video/api/users/author/recommendations?view=tv&limit=20",
+            "https://api.divine.video/api/v2/videos?view=tv&seed=1",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert!(
+                !strict_tv_uses_caller_context(url.path(), &url, false),
+                "{url}"
+            );
+        }
+        let url = Url::parse("https://api.divine.video/api/v2/videos?view=tv").unwrap();
+        assert!(strict_tv_uses_caller_context(url.path(), &url, true));
+    }
+
+    #[test]
+    fn strict_tv_success_requires_current_origin_policy() {
+        assert!(!strict_tv_response_allowed(StatusCode::OK, None));
+        assert!(!strict_tv_response_allowed(
+            StatusCode::OK,
+            Some("strict-v0")
+        ));
+        assert!(strict_tv_response_allowed(
+            StatusCode::OK,
+            Some("strict-v1")
+        ));
+        assert!(!strict_tv_response_allowed(
+            StatusCode::FOUND,
+            Some("strict-v1")
+        ));
+        assert!(strict_tv_response_allowed(StatusCode::NOT_FOUND, None));
+        assert!(strict_tv_response_allowed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            None
+        ));
+    }
+
+    #[test]
+    fn strict_tv_cache_rejects_an_exhausted_lease() {
+        let lease = Some(Duration::from_secs(1));
+        assert!(!strict_tv_lease_expired(lease, Duration::from_millis(999)));
+        assert!(strict_tv_lease_expired(lease, Duration::from_secs(1)));
+        assert!(strict_tv_lease_expired(lease, Duration::from_secs(2)));
+        assert!(!strict_tv_lease_expired(None, Duration::from_secs(2)));
+
+        // Unleased 2xx responses reject nonzero or malformed Age; non-2xx pass through.
+        assert!(!strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::ZERO,
+            true
+        ));
+        assert!(strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::from_secs(1),
+            false
+        ));
+        assert!(strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::ZERO,
+            false
+        ));
+        assert!(!strict_tv_unleased_success_age_rejected(
+            StatusCode::NOT_FOUND,
+            None,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+
+    #[test]
+    fn strict_tv_cache_lease_requires_an_explicit_success_ttl() {
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=15")),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=120, stale-if-error=86400")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::OK, Some("no-store, max-age=30")),
+            None
+        );
+        assert_eq!(strict_tv_cache_lease(StatusCode::OK, None), None);
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::OK, Some("max-age=0")),
+            None
+        );
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::SERVICE_UNAVAILABLE, Some("max-age=30")),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_tv_normalizes_encoded_duplicate_slash_and_dot_paths() {
+        for (raw_path, expected) in [
+            ("/api//v2/videos", Some(TvRequest::Strict)),
+            ("/api/v2/%76ideos", Some(TvRequest::Strict)),
+            ("/api/v2%2Fvideos", Some(TvRequest::Strict)),
+            ("/api/v2/./videos/", Some(TvRequest::Strict)),
+            ("/api/v2/other/../videos", Some(TvRequest::Strict)),
+            (
+                "/api/v2/lists/author/my%2Flist/items",
+                Some(TvRequest::Strict),
+            ),
+            ("/api/lists/author/my%2Flist/items", Some(TvRequest::Strict)),
+            ("/api/v2/%6cists", Some(TvRequest::UnsupportedView)),
+            ("/api//v2/lists", Some(TvRequest::UnsupportedView)),
+            ("/api/v2/foo/../lists", Some(TvRequest::UnsupportedView)),
+        ] {
+            let url = Url::parse(&format!("https://api.divine.video{raw_path}?view=tv")).unwrap();
+            assert_eq!(tv_request(raw_path, &url), expected, "{raw_path}");
+        }
+
+        for raw_path in [
+            "/api/users/author//recommendations",
+            "/api/users/author/re%63ommendations",
+            "/api/users/author/./recommendations/",
+            "//api/users/author/recommendations",
+            "/%61pi/users/author/recommendations",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video{raw_path}?view=tv&seed=1"
+            ))
+            .unwrap();
+            assert!(
+                strict_tv_uses_caller_context(raw_path, &url, false),
+                "{raw_path}"
+            );
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    false,
+                    false,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "{raw_path}"
+            );
+        }
+
+        for raw_path in ["//api/v2/videos", "/%61pi/v2/videos"] {
+            let url = Url::parse(&format!("https://api.divine.video{raw_path}?view=tv")).unwrap();
+            assert_eq!(tv_request(raw_path, &url), Some(TvRequest::Strict));
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    true,
+                    false,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "auth {raw_path}"
+            );
+            assert_eq!(
+                strict_tv_cache_mode(
+                    "api.divine.video",
+                    "GET",
+                    raw_path,
+                    &url,
+                    false,
+                    true,
+                    false,
+                    FUNNELCAKE_API_BACKEND,
+                ),
+                PassthroughCacheMode::Pass,
+                "pubkey {raw_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_tv_pass_only_allows_zero_age() {
+        for age in ["0", "00"] {
+            assert!(strict_tv_pass_age_allowed(&age.parse().unwrap()));
+        }
+        for age in ["", "1", "0, 0", "invalid", "99999999999999999999"] {
+            assert!(!strict_tv_pass_age_allowed(&age.parse().unwrap()));
         }
     }
 
