@@ -45,7 +45,8 @@ curl -H 'Host: api.divine.video' http://127.0.0.1:8787/api/videos
    - **Request Coalescing:** Enable to collapse concurrent cache misses against ClickHouse.
    - **Cache-Control / Smart Cache:** Honor origin `Cache-Control` / `CDN-Cache-Control` for `application/json` (do not restrict caching to static extensions).
    - **Edge Rules (pre-cache bypasses, essential for Middleware mode):** `bunny/deploy_bunny.py` creates and reconciles these (rules prefixed `divine-router:`); the script is the source of truth.
-     - Bypass cache when the `Authorization` request header is present, and mark those responses `Cache-Control: private, no-store`.
+     - Bypass cache when the `Authorization` or `X-Pubkey` request header is present, and mark those responses `Cache-Control: private, no-store`.
+     - Bypass cache for caller-specific recommendations (`/api/users/*/recommendations` with `followed_hashtags`, `preferred_languages`, or `seed`).
      - Bypass cache for candidate hosts (`api2.divine.video`, `relay2.divine.video`).
      - Bypass cache for `/.well-known/*`, `/ap`, `/ap/*`, `/nodeinfo`, `/nodeinfo/*`, `/api/docs*`.
      - Bypass cache for the exact mobile API routes (`/v1/account/moderation-status`, `/v1/minor-review-cases/greenlight`, `/v1/minor-review-cases/*/parent-contact`, `/v1/minor-review-cases/*/parent-consent`, `/api/zendesk/pre-auth`).

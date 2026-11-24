@@ -756,18 +756,28 @@ export function normalizedApiPathSegments(path: string): string[] | null {
   return segments;
 }
 
-/**
- * Classifies strict TV API requests identically to `tv_request` in `src/main.rs`.
- * Search, comments, featured-tabs index, and public-list browse require
- * `moderation_profile=strict`; feed and item routes also accept `view=tv`.
- */
-export function tvRequest(path: string, url: URL): TvRequest | null {
-  const segments = normalizedApiPathSegments(path);
-  if (segments === null) {
-    return null;
+function rawSplitApiPathSegments(path: string): string[] | null {
+  const segments: string[] = [];
+  for (const rawSegment of path.split("/")) {
+    let segment: string;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      return null;
+    }
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
   }
-  let supportsTvView: boolean | null = null;
+  return segments;
+}
 
+function matchStrictTvSupportsView(segments: string[]): boolean | null {
   if (
     (segments.length === 2 && segments[0] === "api" &&
       (segments[1] === "search" || segments[1] === "featured-tabs")) ||
@@ -778,8 +788,9 @@ export function tvRequest(path: string, url: URL): TvRequest | null {
     (segments.length === 5 && segments[0] === "api" &&
       segments[1] === "v2" && segments[2] === "videos" && segments[4] === "comments")
   ) {
-    supportsTvView = false;
-  } else if (
+    return false;
+  }
+  if (
     (segments.length === 2 && segments[0] === "api" &&
       segments[1] === "videos") ||
     (segments.length === 3 && segments[0] === "api" &&
@@ -794,8 +805,26 @@ export function tvRequest(path: string, url: URL): TvRequest | null {
     (segments.length === 4 && segments[0] === "api" &&
       segments[1] === "featured-tabs" && segments[3] === "videos")
   ) {
-    supportsTvView = true;
+    return true;
   }
+  return null;
+}
+
+/**
+ * Classifies strict TV API requests identically to `tv_request` in `src/main.rs`.
+ * Search, comments, featured-tabs index, and public-list browse require
+ * `moderation_profile=strict`; feed and item routes also accept `view=tv`.
+ *
+ * Matches against both full-decoded segments (catching `/api/v2%2Fvideos`) and
+ * raw-slash-split per-segment-decoded segments (catching `%2F` inside a list
+ * d-tag like `/api/v2/lists/<pubkey>/my%2Flist/items`).
+ */
+export function tvRequest(path: string, url: URL): TvRequest | null {
+  const fullSegments = normalizedApiPathSegments(path);
+  const rawSegments = rawSplitApiPathSegments(path);
+  const supportsTvView =
+    (fullSegments !== null ? matchStrictTvSupportsView(fullSegments) : null) ??
+    (rawSegments !== null ? matchStrictTvSupportsView(rawSegments) : null);
 
   if (supportsTvView === null) {
     return null;
@@ -831,6 +860,16 @@ export function isStrictTvApiRequest(
   );
 }
 
+function isUserRecommendationsSegments(segments: string[] | null): boolean {
+  return (
+    segments !== null &&
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "users" &&
+    segments[3] === "recommendations"
+  );
+}
+
 export function strictTvUsesCallerContext(
   path: string,
   url: URL,
@@ -840,15 +879,9 @@ export function strictTvUsesCallerContext(
     return true;
   }
 
-  const segments = normalizedApiPathSegments(path);
-  if (segments === null) {
-    return false;
-  }
   const isUserRecommendations =
-    segments.length === 4 &&
-    segments[0] === "api" &&
-    segments[1] === "users" &&
-    segments[3] === "recommendations";
+    isUserRecommendationsSegments(normalizedApiPathSegments(path)) ||
+    isUserRecommendationsSegments(rawSplitApiPathSegments(path));
   if (!isUserRecommendations) {
     return false;
   }

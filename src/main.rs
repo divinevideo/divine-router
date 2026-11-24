@@ -803,24 +803,58 @@ fn normalized_api_path_segments(path: &str) -> Option<Vec<String>> {
     Some(segments)
 }
 
-fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
-    let owned = normalized_api_path_segments(path)?;
-    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let supports_tv_view = match segments.as_slice() {
+fn raw_split_api_path_segments(path: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    for raw_segment in path.split('/') {
+        let segment = percent_decode_path(raw_segment)?;
+        match segment.as_str() {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
+    Some(segments)
+}
+
+fn match_strict_tv_supports_view(segments: &[String]) -> Option<bool> {
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match refs.as_slice() {
         ["api", "search"]
         | ["api", "v2", "search"]
         | ["api", "featured-tabs"]
         | ["api", "v2", "lists"]
         | ["api", "videos", _, "comments"]
-        | ["api", "v2", "videos", _, "comments"] => false,
+        | ["api", "v2", "videos", _, "comments"] => Some(false),
         ["api", "videos"]
         | ["api", "v2", "videos"]
         | ["api", "lists", _, _, "items"]
         | ["api", "v2", "lists", _, _, "items"]
         | ["api", "users", _, "feed" | "recommendations"]
-        | ["api", "featured-tabs", _, "videos"] => true,
-        _ => return None,
+        | ["api", "featured-tabs", _, "videos"] => Some(true),
+        _ => None,
+    }
+}
+
+fn is_user_recommendations_segments(segments: Option<&[String]>) -> bool {
+    let Some(segments) = segments else {
+        return false;
     };
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(refs.as_slice(), ["api", "users", _, "recommendations"])
+}
+
+fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
+    // Check both full-decoded segments (catches `/api/v2%2Fvideos`) and
+    // raw-slash-split per-segment-decoded segments (catches `%2F` inside a
+    // list d-tag such as `/api/v2/lists/<pubkey>/my%2Flist/items`).
+    let full = normalized_api_path_segments(path);
+    let raw = raw_split_api_path_segments(path);
+    let supports_tv_view = full
+        .as_deref()
+        .and_then(match_strict_tv_supports_view)
+        .or_else(|| raw.as_deref().and_then(match_strict_tv_supports_view))?;
     let mut view = false;
     for (key, value) in url.query_pairs() {
         match (key.as_ref(), value.as_ref()) {
@@ -844,11 +878,11 @@ fn strict_tv_uses_caller_context(path: &str, url: &Url, has_pubkey: bool) -> boo
     // Funnelcake does not share recommendations with request-specific ranking
     // inputs. Pass these before lookup so private responses do not serialize
     // waiters behind repeated uncacheable fills.
-    let Some(owned) = normalized_api_path_segments(path) else {
-        return false;
-    };
-    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
-    matches!(segments.as_slice(), ["api", "users", _, "recommendations"])
+    let full = normalized_api_path_segments(path);
+    let raw = raw_split_api_path_segments(path);
+    let is_recommendations = is_user_recommendations_segments(full.as_deref())
+        || is_user_recommendations_segments(raw.as_deref());
+    is_recommendations
         && url.query_pairs().any(|(name, _)| {
             matches!(
                 name.as_ref(),
@@ -879,20 +913,43 @@ fn strict_tv_cache_lease(status: StatusCode, surrogate_control: Option<&str>) ->
         return None;
     }
 
-    let max_age = surrogate_control?
-        .split(',')
-        .filter_map(|directive| {
-            let (name, value) = directive.trim().split_once('=')?;
-            name.eq_ignore_ascii_case("max-age")
-                .then(|| value.trim().parse::<u64>().ok())
-                .flatten()
-        })
-        .min()?;
+    let mut min_max_age: Option<u64> = None;
+    for raw_directive in surrogate_control?.split(',') {
+        let directive = raw_directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let (name, value) = match directive.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (directive, None),
+        };
+        if name.eq_ignore_ascii_case("no-store")
+            || name.eq_ignore_ascii_case("private")
+            || name.eq_ignore_ascii_case("no-cache")
+        {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("max-age") {
+            if let Some(secs) = value.and_then(|v| v.parse::<u64>().ok()) {
+                min_max_age = Some(min_max_age.map_or(secs, |cur| cur.min(secs)));
+            }
+        }
+    }
+    let max_age = min_max_age?;
     (max_age > 0).then(|| Duration::from_secs(max_age).min(STRICT_TV_MAX_AGE))
 }
 
 fn strict_tv_lease_expired(lease: Option<Duration>, age: Duration) -> bool {
     lease.is_some_and(|lease| age >= lease)
+}
+
+fn strict_tv_unleased_success_age_rejected(
+    status: StatusCode,
+    lease: Option<Duration>,
+    age: Duration,
+    all_ages_zero_or_absent: bool,
+) -> bool {
+    status.is_success() && lease.is_none() && (age > Duration::ZERO || !all_ages_zero_or_absent)
 }
 
 fn strict_tv_pass_age_allowed(age: &fastly::http::HeaderValue) -> bool {
@@ -917,7 +974,12 @@ fn configure_strict_tv_cache(req: &mut Request, public_host: &str) {
 
         let lease = strict_tv_cache_lease(status, candidate.get_header_str("surrogate-control"));
         let age = candidate.get_age();
-        if strict_tv_lease_expired(lease, age) {
+        let all_ages_zero_or_absent = candidate
+            .get_header_all(header::AGE)
+            .all(strict_tv_pass_age_allowed);
+        if strict_tv_lease_expired(lease, age)
+            || strict_tv_unleased_success_age_rejected(status, lease, age, all_ages_zero_or_absent)
+        {
             return Err(SendErrorCause::Custom(Error::msg(
                 "strict TV lease expired",
             )));
@@ -2766,6 +2828,32 @@ mod tests {
         assert!(strict_tv_lease_expired(lease, Duration::from_secs(1)));
         assert!(strict_tv_lease_expired(lease, Duration::from_secs(2)));
         assert!(!strict_tv_lease_expired(None, Duration::from_secs(2)));
+
+        // Unleased 2xx responses reject nonzero or malformed Age; non-2xx pass through.
+        assert!(!strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::ZERO,
+            true
+        ));
+        assert!(strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::from_secs(1),
+            false
+        ));
+        assert!(strict_tv_unleased_success_age_rejected(
+            StatusCode::OK,
+            None,
+            Duration::ZERO,
+            false
+        ));
+        assert!(!strict_tv_unleased_success_age_rejected(
+            StatusCode::NOT_FOUND,
+            None,
+            Duration::from_secs(60),
+            false
+        ));
     }
 
     #[test]
@@ -2777,6 +2865,10 @@ mod tests {
         assert_eq!(
             strict_tv_cache_lease(StatusCode::OK, Some("max-age=120, stale-if-error=86400")),
             Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            strict_tv_cache_lease(StatusCode::OK, Some("no-store, max-age=30")),
+            None
         );
         assert_eq!(strict_tv_cache_lease(StatusCode::OK, None), None);
         assert_eq!(
@@ -2794,8 +2886,14 @@ mod tests {
         for (raw_path, expected) in [
             ("/api//v2/videos", Some(TvRequest::Strict)),
             ("/api/v2/%76ideos", Some(TvRequest::Strict)),
+            ("/api/v2%2Fvideos", Some(TvRequest::Strict)),
             ("/api/v2/./videos/", Some(TvRequest::Strict)),
             ("/api/v2/other/../videos", Some(TvRequest::Strict)),
+            (
+                "/api/v2/lists/author/my%2Flist/items",
+                Some(TvRequest::Strict),
+            ),
+            ("/api/lists/author/my%2Flist/items", Some(TvRequest::Strict)),
             ("/api/v2/%6cists", Some(TvRequest::UnsupportedView)),
             ("/api//v2/lists", Some(TvRequest::UnsupportedView)),
             ("/api/v2/foo/../lists", Some(TvRequest::UnsupportedView)),

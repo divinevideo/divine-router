@@ -1327,8 +1327,11 @@ Deno.test("strict TV normalizes encoded, duplicate-slash, and dot-segment paths"
     const [rawPath, expected] of [
       ["/api//v2/videos", "Strict"],
       ["/api/v2/%76ideos", "Strict"],
+      ["/api/v2%2Fvideos", "Strict"],
       ["/api/v2/./videos/", "Strict"],
       ["/api/v2/other/../videos", "Strict"],
+      ["/api/v2/lists/author/my%2Flist/items", "Strict"],
+      ["/api/lists/author/my%2Flist/items", "Strict"],
       ["/api/v2/%6cists", "UnsupportedView"],
       ["/api//v2/lists", "UnsupportedView"],
       ["/api/v2/foo/../lists", "UnsupportedView"],
@@ -1538,6 +1541,21 @@ Deno.test("Bunny strict TV fails closed on unattested 200, 3xx, expired lease, u
     }),
   });
   assertEquals(badAge.status, 503);
+
+  // Unleased 2xx with nonzero or malformed Age must also fail closed with 503.
+  for (const age of ["1", "3600", "5, 5", "invalid", ""]) {
+    const unleasedAged = await middleware.onOriginResponse({
+      request: strictReq,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: {
+          [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+          age,
+        },
+      }),
+    });
+    assertEquals(unleasedAged.status, 503, `unleased 200 with Age=${age}`);
+  }
 
   // Non-ASCII Surrogate-Key fails closed to uncached 200 (never stored without purge tags).
   const badKey = await middleware.onOriginResponse({

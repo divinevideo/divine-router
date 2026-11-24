@@ -480,8 +480,12 @@ export function applyStrictTvResponsePolicy(
   }
 
   const leaseSecs = strictTvCacheLeaseSecs(status, response.headers.get("surrogate-control"));
-  const ageSecs = parseStrictTvAgeSecs(response.headers.get("age"));
-  if (strictTvLeaseExpired(leaseSecs, ageSecs)) {
+  const ageHeader = response.headers.get("age");
+  const ageSecs = parseStrictTvAgeSecs(ageHeader);
+  if (
+    strictTvLeaseExpired(leaseSecs, ageSecs) ||
+    (isSuccess && leaseSecs === null && !strictTvPassAgeAllowed(ageHeader))
+  ) {
     console.error("strict TV lease expired");
     void response.body?.cancel().catch(() => {});
     return strictTvUnavailableResponse();
