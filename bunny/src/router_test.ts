@@ -36,7 +36,6 @@ import {
   MOBILE_API_BACKEND_HOST,
   normalizedAcceptEncoding,
   parseStrictTvAgeSecs,
-  parseStrictTvCdnTags,
   parseWebFingerResource,
   passthroughCacheMode,
   passthroughHeaders,
@@ -53,6 +52,7 @@ import {
   STRICT_TV_POLICY,
   STRICT_TV_POLICY_HEADER,
   strictTvCacheLeaseSecs,
+  strictTvCdnTag,
   strictTvLeaseExpired,
   strictTvPassAgeAllowed,
   strictTvResponseAllowed,
@@ -1303,14 +1303,51 @@ Deno.test("strict TV caller context, lease, age, policy, and CDN-Tag helpers mat
   }
 
   assertEquals(
-    parseStrictTvCdnTags("videos strict-tv author-abc strict-tv event-def"),
-    ["videos", "strict-tv", "author-abc", "event-def"],
+    strictTvCdnTag("videos strict-tv author-abc strict-tv event-def"),
+    "strict-tv",
   );
-  assertEquals(parseStrictTvCdnTags(null), null);
-  assertEquals(parseStrictTvCdnTags("videos author-abc"), null);
+  // Multi-video Surrogate-Key headers exceed Bunny's 1024-byte CDN-Tag cap;
+  // emitting only the 9-byte `strict-tv` tag avoids silent truncation.
+  const largeKeys = [
+    "videos",
+    "strict-tv",
+    ...Array.from({ length: 20 }, (_, i) => `event-${String(i).padStart(64, "a")}`),
+  ].join(" ");
+  assertEquals(largeKeys.length > 1024, true);
+  assertEquals(strictTvCdnTag(largeKeys), "strict-tv");
+  assertEquals(strictTvCdnTag(null), null);
+  assertEquals(strictTvCdnTag("videos author-abc"), null);
   // Fail closed on non-ASCII or comma tokens, matching Fastly's HeaderValue::to_str() check.
-  assertEquals(parseStrictTvCdnTags("videos strict-tv list-abc-música"), null);
-  assertEquals(parseStrictTvCdnTags("videos,strict-tv"), null);
+  assertEquals(strictTvCdnTag("videos strict-tv list-abc-música"), null);
+  assertEquals(strictTvCdnTag("videos,strict-tv"), null);
+});
+
+Deno.test("strict TV normalizes encoded, duplicate-slash, and dot-segment paths", () => {
+  for (
+    const [rawPath, expected] of [
+      ["/api//v2/videos", "Strict"],
+      ["/api/v2/%76ideos", "Strict"],
+      ["/api/v2/./videos/", "Strict"],
+      ["/api/v2/other/../videos", "Strict"],
+      ["/api/v2/%6cists", "UnsupportedView"],
+      ["/api//v2/lists", "UnsupportedView"],
+      ["/api/v2/foo/../lists", "UnsupportedView"],
+    ] as const
+  ) {
+    const url = new URL(`https://api.divine.video${rawPath}?view=tv`);
+    assertEquals(tvRequest(rawPath, url), expected, rawPath);
+  }
+
+  for (
+    const rawPath of [
+      "/api/users/author//recommendations",
+      "/api/users/author/re%63ommendations",
+      "/api/users/author/./recommendations/",
+    ]
+  ) {
+    const url = new URL(`https://api.divine.video${rawPath}?view=tv&seed=1`);
+    assertEquals(strictTvUsesCallerContext(rawPath, url, false), true, rawPath);
+  }
 });
 
 Deno.test("Bunny strict TV caches attested 2xx up to 30s with CDN-Tag and zero stale", async () => {
@@ -1347,7 +1384,7 @@ Deno.test("Bunny strict TV caches attested 2xx up to 30s with CDN-Tag and zero s
   assertEquals(resp.status, 200);
   assertEquals(resp.headers.get("surrogate-control"), null);
   assertEquals(resp.headers.get("surrogate-key"), null);
-  assertEquals(resp.headers.get("cdn-tag"), "videos, strict-tv, author-abc, event-def");
+  assertEquals(resp.headers.get("cdn-tag"), "strict-tv");
   assertEquals(
     resp.headers.get("cdn-cache-control"),
     "public, max-age=20, must-revalidate, stale-if-error=0, stale-while-revalidate=0",
@@ -1356,6 +1393,73 @@ Deno.test("Bunny strict TV caches attested 2xx up to 30s with CDN-Tag and zero s
     resp.headers.get("cache-control"),
     "public, max-age=0, must-revalidate, proxy-revalidate, s-maxage=20, stale-if-error=0, stale-while-revalidate=0",
   );
+});
+
+Deno.test("Bunny strict TV fails closed on hop-token mismatch and never caches 4xx/5xx, Set-Cookie, or private responses", async () => {
+  // Cross-isolate execution with mismatched hop tokens and no publicHostOverride fails closed.
+  const isolateA = createPullZoneMiddleware();
+  const isolateB = createPullZoneMiddleware();
+  const built = await isolateA.onOriginRequest({
+    request: new Request("https://api.divine.video/api/v2/videos?moderation_profile=strict", {
+      headers: { host: "api.divine.video" },
+    }),
+  }) as Request;
+  const mismatch = await isolateB.onOriginResponse({
+    request: built,
+    response: new Response('{"videos":[]}', { status: 200 }),
+  });
+  assertEquals(mismatch.status, 503);
+  assertEquals(mismatch.headers.get("access-control-allow-origin"), "*");
+  assertEquals(mismatch.headers.get("cache-control"), "private, no-store");
+  assertEquals(mismatch.headers.get("cdn-cache-control"), "no-store");
+
+  // 4xx/5xx, Set-Cookie, and origin private/no-store/no-cache responses stay uncached.
+  const middleware = createPullZoneMiddleware({ hopToken: "tok" });
+  const req = await middleware.onOriginRequest({
+    request: new Request("https://api.divine.video/api/v2/videos?view=tv", {
+      headers: { host: "api.divine.video" },
+    }),
+  }) as Request;
+
+  for (const status of [404, 500, 503]) {
+    const errResp = await middleware.onOriginResponse({
+      request: req,
+      response: new Response('{"error":"upstream"}', {
+        status,
+        headers: { "surrogate-control": "max-age=30", "surrogate-key": "videos strict-tv" },
+      }),
+    });
+    assertEquals(errResp.status, status);
+    assertEquals(errResp.headers.get("cdn-tag"), null);
+    assertEquals(errResp.headers.get("cdn-cache-control"), "no-store");
+    assertEquals(errResp.headers.get("cache-control"), "private, no-store");
+  }
+
+  for (
+    const extraHeaders of [
+      { "set-cookie": "sid=abc; Path=/" },
+      { "cache-control": "private, max-age=30" },
+      { "cache-control": "no-store" },
+      { "cache-control": "no-cache" },
+    ] as Array<Record<string, string>>
+  ) {
+    const resp = await middleware.onOriginResponse({
+      request: req,
+      response: new Response('{"videos":[]}', {
+        status: 200,
+        headers: {
+          [STRICT_TV_POLICY_HEADER]: STRICT_TV_POLICY,
+          "surrogate-control": "max-age=30",
+          "surrogate-key": "videos strict-tv",
+          ...extraHeaders,
+        },
+      }),
+    });
+    assertEquals(resp.status, 200);
+    assertEquals(resp.headers.get("cdn-tag"), null);
+    assertEquals(resp.headers.get("cdn-cache-control"), "no-store");
+    assertEquals(resp.headers.get("cache-control"), "private, no-store");
+  }
 });
 
 Deno.test("Bunny strict TV fails closed on unattested 200, 3xx, expired lease, upstream error, and bad view=tv", async () => {

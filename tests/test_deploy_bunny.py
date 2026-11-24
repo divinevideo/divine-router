@@ -78,8 +78,11 @@ class DeployBunnyTests(unittest.TestCase):
             "*://www.divine.video/api/links?*",
             "*://divine.video/l?*",
             "*://*/api/users/*/recommendations?*followed_hashtags*",
+            "*://*/api/users/*/recommendations/?*followed_hashtags*",
             "*://*/api/users/*/recommendations?*preferred_languages*",
+            "*://*/api/users/*/recommendations/?*preferred_languages*",
             "*://*/api/users/*/recommendations?*seed*",
+            "*://*/api/users/*/recommendations/?*seed*",
         ):
             self.assertIn(route, patterns)
         header_triggers = [

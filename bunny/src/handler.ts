@@ -16,7 +16,6 @@ import {
   normalizedAcceptEncoding,
   parseEffectiveCacheTtlSecs,
   parseStrictTvAgeSecs,
-  parseStrictTvCdnTags,
   parseWebFingerResource,
   passthroughCacheMode,
   passthroughHeaders,
@@ -28,6 +27,7 @@ import {
   STRICT_TV_POLICY_HEADER,
   strictTvBadRequestResponse,
   strictTvCacheLeaseSecs,
+  strictTvCdnTag,
   strictTvLeaseExpired,
   strictTvPassAgeAllowed,
   strictTvResponseAllowed,
@@ -455,6 +455,7 @@ export function applyStrictTvResponsePolicy(
   const status = response.status;
   if (!strictTvResponseAllowed(status, response.headers.get(STRICT_TV_POLICY_HEADER))) {
     console.error(`strict TV policy or status rejected: ${status}`);
+    void response.body?.cancel();
     return strictTvUnavailableResponse();
   }
 
@@ -462,6 +463,7 @@ export function applyStrictTvResponsePolicy(
   if (cacheMode.kind === "Pass") {
     if (isSuccess && !strictTvPassAgeAllowed(response.headers.get("age"))) {
       console.error("strict TV pass rejected a nonzero or invalid Age");
+      void response.body?.cancel();
       return strictTvUnavailableResponse();
     }
     const headers = new Headers(response.headers);
@@ -481,14 +483,15 @@ export function applyStrictTvResponsePolicy(
   const ageSecs = parseStrictTvAgeSecs(response.headers.get("age"));
   if (strictTvLeaseExpired(leaseSecs, ageSecs)) {
     console.error("strict TV lease expired");
+    void response.body?.cancel();
     return strictTvUnavailableResponse();
   }
 
   const headers = new Headers(response.headers);
-  const cdnTags = parseStrictTvCdnTags(headers.get("surrogate-key"));
+  const cdnTag = strictTvCdnTag(headers.get("surrogate-key"));
   const setsCookie = headers.has("set-cookie");
   const originCc = headers.get("cache-control") ?? "";
-  const originPrivateOrNoStore = /(?:^|,|\s)(?:private|no-store)(?:$|,|\s|=)/i.test(originCc);
+  const originUncacheable = /(?:^|,|\s)(?:private|no-store|no-cache)(?:$|,|\s|=)/i.test(originCc);
   const remaining =
     leaseSecs !== null && ageSecs !== null
       ? Math.min(Math.max(0, leaseSecs - ageSecs), STRICT_TV_MAX_AGE_SECS)
@@ -497,8 +500,8 @@ export function applyStrictTvResponsePolicy(
   headers.delete("surrogate-control");
   headers.delete("surrogate-key");
 
-  if (remaining > 0 && cdnTags !== null && !setsCookie && !originPrivateOrNoStore) {
-    headers.set("cdn-tag", cdnTags.join(", "));
+  if (remaining > 0 && cdnTag !== null && !setsCookie && !originUncacheable) {
+    headers.set("cdn-tag", cdnTag);
     headers.set(
       "cdn-cache-control",
       `public, max-age=${remaining}, must-revalidate, stale-if-error=0, stale-while-revalidate=0`,
@@ -740,6 +743,20 @@ export function createPullZoneMiddleware(config: RouterConfig = {}) {
     const decision = routeDecisionFor(originalHost, method, path);
     const isWebsocketUpgrade =
       (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+
+    if (
+      !config.publicHostOverride &&
+      !builtByRouter &&
+      method === "GET" &&
+      tvRequest(path, url) !== null
+    ) {
+      // Cross-isolate execution without PUBLIC_HOST_OVERRIDE or a shared
+      // ROUTER_HOP_TOKEN cannot trust the rewritten Host header; fail closed
+      // so strict TV responses are never served unverified.
+      console.error("strict TV response rejected: missing or mismatched router hop token");
+      void ctx.response.body?.cancel();
+      return Promise.resolve(strictTvUnavailableResponse());
+    }
 
     if (
       decision.kind === "Passthrough" &&

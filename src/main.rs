@@ -767,21 +767,58 @@ enum TvRequest {
     UnsupportedView,
 }
 
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn normalized_api_path_segments(path: &str) -> Option<Vec<String>> {
+    let decoded = percent_decode_path(path)?;
+    let mut segments = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment.to_string()),
+        }
+    }
+    Some(segments)
+}
+
 fn tv_request(path: &str, url: &Url) -> Option<TvRequest> {
-    let segments: Vec<_> = path.trim_end_matches('/').split('/').collect();
+    let owned = normalized_api_path_segments(path)?;
+    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
     let supports_tv_view = match segments.as_slice() {
-        ["", "api", "search"]
-        | ["", "api", "v2", "search"]
-        | ["", "api", "featured-tabs"]
-        | ["", "api", "v2", "lists"]
-        | ["", "api", "videos", _, "comments"]
-        | ["", "api", "v2", "videos", _, "comments"] => false,
-        ["", "api", "videos"]
-        | ["", "api", "v2", "videos"]
-        | ["", "api", "lists", _, _, "items"]
-        | ["", "api", "v2", "lists", _, _, "items"]
-        | ["", "api", "users", _, "feed" | "recommendations"]
-        | ["", "api", "featured-tabs", _, "videos"] => true,
+        ["api", "search"]
+        | ["api", "v2", "search"]
+        | ["api", "featured-tabs"]
+        | ["api", "v2", "lists"]
+        | ["api", "videos", _, "comments"]
+        | ["api", "v2", "videos", _, "comments"] => false,
+        ["api", "videos"]
+        | ["api", "v2", "videos"]
+        | ["api", "lists", _, _, "items"]
+        | ["api", "v2", "lists", _, _, "items"]
+        | ["api", "users", _, "feed" | "recommendations"]
+        | ["api", "featured-tabs", _, "videos"] => true,
         _ => return None,
     };
     let mut view = false;
@@ -807,18 +844,17 @@ fn strict_tv_uses_caller_context(path: &str, url: &Url, has_pubkey: bool) -> boo
     // Funnelcake does not share recommendations with request-specific ranking
     // inputs. Pass these before lookup so private responses do not serialize
     // waiters behind repeated uncacheable fills.
-    matches!(
-        path.trim_end_matches('/')
-            .split('/')
-            .collect::<Vec<_>>()
-            .as_slice(),
-        ["", "api", "users", _, "recommendations"]
-    ) && url.query_pairs().any(|(name, _)| {
-        matches!(
-            name.as_ref(),
-            "followed_hashtags" | "preferred_languages" | "seed"
-        )
-    })
+    let Some(owned) = normalized_api_path_segments(path) else {
+        return false;
+    };
+    let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
+    matches!(segments.as_slice(), ["api", "users", _, "recommendations"])
+        && url.query_pairs().any(|(name, _)| {
+            matches!(
+                name.as_ref(),
+                "followed_hashtags" | "preferred_languages" | "seed"
+            )
+        })
 }
 
 fn strict_tv_cache_key(public_host: &str, url: &Url) -> [u8; 32] {
@@ -935,7 +971,7 @@ fn passthrough(req: Request, backend: &str, original_host: &str) -> Result<Respo
         .unwrap_or(false);
     let tv_request = if backend == FUNNELCAKE_API_BACKEND
         && matches!(classify_host(original_host), HostType::System(ref subdomain) if subdomain == "api")
-        && req.get_method_str() == "GET"
+        && req.get_method_str().eq_ignore_ascii_case("GET")
     {
         tv_request(&path, req.get_url())
     } else {
@@ -2713,6 +2749,37 @@ mod tests {
             strict_tv_cache_lease(StatusCode::SERVICE_UNAVAILABLE, Some("max-age=30")),
             None
         );
+    }
+
+    #[test]
+    fn strict_tv_normalizes_encoded_duplicate_slash_and_dot_paths() {
+        for (raw_path, expected) in [
+            ("/api//v2/videos", Some(TvRequest::Strict)),
+            ("/api/v2/%76ideos", Some(TvRequest::Strict)),
+            ("/api/v2/./videos/", Some(TvRequest::Strict)),
+            ("/api/v2/other/../videos", Some(TvRequest::Strict)),
+            ("/api/v2/%6cists", Some(TvRequest::UnsupportedView)),
+            ("/api//v2/lists", Some(TvRequest::UnsupportedView)),
+            ("/api/v2/foo/../lists", Some(TvRequest::UnsupportedView)),
+        ] {
+            let url = Url::parse(&format!("https://api.divine.video{raw_path}?view=tv")).unwrap();
+            assert_eq!(tv_request(raw_path, &url), expected, "{raw_path}");
+        }
+
+        for raw_path in [
+            "/api/users/author//recommendations",
+            "/api/users/author/re%63ommendations",
+            "/api/users/author/./recommendations/",
+        ] {
+            let url = Url::parse(&format!(
+                "https://api.divine.video{raw_path}?view=tv&seed=1"
+            ))
+            .unwrap();
+            assert!(
+                strict_tv_uses_caller_context(raw_path, &url, false),
+                "{raw_path}"
+            );
+        }
     }
 
     #[test]

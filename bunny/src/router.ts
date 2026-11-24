@@ -730,39 +730,69 @@ export function parseEffectiveCacheTtlSecs(headers: Headers): {
 export type TvRequest = "Strict" | "UnsupportedView";
 
 /**
+ * Normalizes a request path identically to `normalized_api_path_segments` in
+ * `src/main.rs` and NGINX Gateway (`merge_slashes`, URI decoding, dot-segment
+ * resolution) so raw-path tricks like `/api//v2/videos` or `/api/v2/%76ideos`
+ * cannot bypass the strict TV gate or caller-context checks.
+ */
+export function normalizedApiPathSegments(path: string): string[] | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return null;
+  }
+  const segments: string[] = [];
+  for (const segment of decoded.split("/")) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return segments;
+}
+
+/**
  * Classifies strict TV API requests identically to `tv_request` in `src/main.rs`.
  * Search, comments, featured-tabs index, and public-list browse require
  * `moderation_profile=strict`; feed and item routes also accept `view=tv`.
  */
 export function tvRequest(path: string, url: URL): TvRequest | null {
-  const segments = path.replace(/\/+$/, "").split("/");
+  const segments = normalizedApiPathSegments(path);
+  if (segments === null) {
+    return null;
+  }
   let supportsTvView: boolean | null = null;
 
   if (
-    (segments.length === 3 && segments[0] === "" && segments[1] === "api" &&
-      (segments[2] === "search" || segments[2] === "featured-tabs")) ||
-    (segments.length === 4 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "v2" && (segments[3] === "search" || segments[3] === "lists")) ||
-    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "videos" && segments[4] === "comments") ||
-    (segments.length === 6 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "v2" && segments[3] === "videos" && segments[5] === "comments")
+    (segments.length === 2 && segments[0] === "api" &&
+      (segments[1] === "search" || segments[1] === "featured-tabs")) ||
+    (segments.length === 3 && segments[0] === "api" &&
+      segments[1] === "v2" && (segments[2] === "search" || segments[2] === "lists")) ||
+    (segments.length === 4 && segments[0] === "api" &&
+      segments[1] === "videos" && segments[3] === "comments") ||
+    (segments.length === 5 && segments[0] === "api" &&
+      segments[1] === "v2" && segments[2] === "videos" && segments[4] === "comments")
   ) {
     supportsTvView = false;
   } else if (
-    (segments.length === 3 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "videos") ||
-    (segments.length === 4 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "v2" && segments[3] === "videos") ||
-    (segments.length === 6 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "lists" && segments[5] === "items") ||
-    (segments.length === 7 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "v2" && segments[3] === "lists" && segments[6] === "items") ||
-    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "users" &&
-      (segments[4] === "feed" || segments[4] === "recommendations")) ||
-    (segments.length === 5 && segments[0] === "" && segments[1] === "api" &&
-      segments[2] === "featured-tabs" && segments[4] === "videos")
+    (segments.length === 2 && segments[0] === "api" &&
+      segments[1] === "videos") ||
+    (segments.length === 3 && segments[0] === "api" &&
+      segments[1] === "v2" && segments[2] === "videos") ||
+    (segments.length === 5 && segments[0] === "api" &&
+      segments[1] === "lists" && segments[4] === "items") ||
+    (segments.length === 6 && segments[0] === "api" &&
+      segments[1] === "v2" && segments[2] === "lists" && segments[5] === "items") ||
+    (segments.length === 4 && segments[0] === "api" &&
+      segments[1] === "users" &&
+      (segments[3] === "feed" || segments[3] === "recommendations")) ||
+    (segments.length === 4 && segments[0] === "api" &&
+      segments[1] === "featured-tabs" && segments[3] === "videos")
   ) {
     supportsTvView = true;
   }
@@ -810,13 +840,15 @@ export function strictTvUsesCallerContext(
     return true;
   }
 
-  const segments = path.replace(/\/+$/, "").split("/");
+  const segments = normalizedApiPathSegments(path);
+  if (segments === null) {
+    return false;
+  }
   const isUserRecommendations =
-    segments.length === 5 &&
-    segments[0] === "" &&
-    segments[1] === "api" &&
-    segments[2] === "users" &&
-    segments[4] === "recommendations";
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "users" &&
+    segments[3] === "recommendations";
   if (!isUserRecommendations) {
     return false;
   }
@@ -931,35 +963,34 @@ export function strictTvPassAgeAllowed(ageHeader: string | null): boolean {
 }
 
 /**
- * Converts Funnelcake's space-delimited `Surrogate-Key` header into Bunny's
- * `CDN-Tag` list. Fails closed (returns `null`) if the header contains any
- * non-visible-ASCII character or comma (matching Fastly's `HeaderValue::to_str()`
- * rejection) or omits the required `strict-tv` purge tag.
+ * Validates Funnelcake's space-delimited `Surrogate-Key` header and returns
+ * Bunny's `CDN-Tag` value (`"strict-tv"`).
+ *
+ * Bunny truncates `CDN-Tag` headers past 1024 bytes, whereas multi-video
+ * Funnelcake feeds routinely emit >2 KB of per-event/per-author surrogate keys.
+ * Emitting only the 9-byte `strict-tv` tag avoids silent truncation while
+ * keeping exact `{"CacheTag": "strict-tv"}` purges reliable regardless of page
+ * size. Fails closed (returns `null`) if the origin header is absent, omits
+ * `strict-tv`, or contains non-visible-ASCII bytes or commas (matching Fastly's
+ * `HeaderValue::to_str()` rejection).
  */
-export function parseStrictTvCdnTags(surrogateKeyHeader: string | null): string[] | null {
+export function strictTvCdnTag(surrogateKeyHeader: string | null): string | null {
   if (surrogateKeyHeader === null) {
     return null;
   }
   for (let i = 0; i < surrogateKeyHeader.length; i++) {
     const code = surrogateKeyHeader.charCodeAt(i);
-    // Allow ASCII space (0x20) and visible ASCII (0x21..=0x7E) except comma (0x2C),
-    // because Bunny's CDN-Tag header is comma-delimited.
     if (code < 0x20 || code > 0x7e || code === 0x2c) {
       return null;
     }
   }
 
-  const seen = new Set<string>();
-  const tags: string[] = [];
   for (const token of surrogateKeyHeader.split(" ")) {
-    if (!token || seen.has(token)) continue;
-    seen.add(token);
-    tags.push(token);
+    if (token === STRICT_TV_SURROGATE_KEY) {
+      return STRICT_TV_SURROGATE_KEY;
+    }
   }
-  if (!seen.has(STRICT_TV_SURROGATE_KEY)) {
-    return null;
-  }
-  return tags;
+  return null;
 }
 
 export function strictTvErrorResponse(status: number, body: string): Response {

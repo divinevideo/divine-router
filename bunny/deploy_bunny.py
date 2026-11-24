@@ -231,8 +231,11 @@ def configure_api_pull_zone(
                     "PatternMatchingType": 0,  # MatchAny
                     "PatternMatches": [
                         "*://*/api/users/*/recommendations?*followed_hashtags*",
+                        "*://*/api/users/*/recommendations/?*followed_hashtags*",
                         "*://*/api/users/*/recommendations?*preferred_languages*",
+                        "*://*/api/users/*/recommendations/?*preferred_languages*",
                         "*://*/api/users/*/recommendations?*seed*",
+                        "*://*/api/users/*/recommendations/?*seed*",
                     ],
                 }
             ],
