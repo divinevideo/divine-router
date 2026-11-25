@@ -6,7 +6,7 @@ authors = ["Divine Video"]
 description = "Fastly edge router for divine.video subdomains"
 
 [dependencies]
-fastly = "0.13"
+fastly = "=0.13.3"
 wit-bindgen = "0.58"
 wasip2 = "1"
 time = "0.3.47"
